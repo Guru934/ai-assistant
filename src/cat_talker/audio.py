@@ -88,13 +88,29 @@ class AudioInterface:
             frames_per_buffer=1024
         )
 
+    def suppress_mic(self):
+        """Assistant output started: mute the mic until release_mic().
+
+        Output-level (not chunk-level): the agent calls this once when the
+        model starts responding, so capture stays muted across ALL audio
+        chunks of the turn with no per-chunk toggling. Plain-bool writes
+        are atomic; readers are the mic callback and this module's threads.
+        """
+        self.is_playing = True
+
+    def release_mic(self):
+        """Model turn finished and output drained: capture may resume."""
+        self.is_playing = False
+
     def _play_audio(self):
         while True:
             chunk = self.audio_out_queue.get()
             if chunk is None:
                 break
 
-            self.is_playing = True
+            # NOTE: playback never touches is_playing. Mic suppression is
+            # owned by the agent at output level (suppress_mic/release_mic)
+            # so state cannot flap between individual chunks.
             if self.volume_cb:
                 import struct
                 import numpy as np
@@ -151,7 +167,6 @@ class AudioInterface:
                     except Exception as ex:
                         logger.error(f"Failed to recreate output stream: {ex}")
 
-            self.is_playing = False
             self.audio_out_queue.task_done()
 
 
