@@ -63,6 +63,8 @@ class GeminiDesktopAgent:
         self._is_processing = False
         self.synthetic_input_queue = asyncio.Queue()
         self.loop = None
+        # run_loop task, set by start_agent_in_thread
+        self._run_task: asyncio.Task | None = None
         # Explicit session/connection state so the mic only feeds the active session
         self._session_active = asyncio.Event()
         self._session_generation = 0  # incremented per new session
@@ -115,6 +117,22 @@ class GeminiDesktopAgent:
         self._output_epoch += 1
         if self.audio is not None:
             self.audio.suppress_mic()
+
+    def request_stop(self):
+        """Thread-safe shutdown request (SIGINT handler / Qt aboutToQuit).
+
+        Sets the stop flag and cancels the run_loop task so even a stuck
+        worker (e.g. a long reconnect backoff) unwinds promptly. Safe to
+        call from any thread, multiple times.
+        """
+        self.stop_event.set()
+        loop = self.loop
+        task = self._run_task
+        if loop is not None and task is not None and not task.done():
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # loop already closed
 
     def _release_mic_after_turn(self):
         """Model turn finished: re-enable the mic once pending assistant
@@ -676,10 +694,27 @@ def start_agent_in_thread(volume_cb, quit_cb=None, text_cb=None, state_cb=None, 
         global_agent_ref.append(agent)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    agent.loop = loop
+    task = loop.create_task(
+        agent.run_loop(volume_cb, quit_cb, text_cb, state_cb, bubble_cb, glow_cb)
+    )
+    agent._run_task = task
     try:
-        loop.run_until_complete(agent.run_loop(volume_cb, quit_cb, text_cb, state_cb, bubble_cb, glow_cb))
-    except KeyboardInterrupt:
+        loop.run_until_complete(task)
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        agent.stop_event.set()
-        loop.close()
+        try:
+            # Stop flag first (workers unwind cooperatively), then cancel
+            # anything still stuck so close() never sees pending tasks.
+            agent.stop_event.set()
+            if not task.done():
+                task.cancel()
+                try:
+                    loop.run_until_complete(task)
+                except asyncio.CancelledError:
+                    pass
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            agent._run_task = None
+            loop.close()

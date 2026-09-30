@@ -529,7 +529,39 @@ def main():
     )
     agent_thread.start()
 
-    sys.exit(app.exec())
+    # Graceful shutdown: Ctrl-C / SIGTERM (and any Qt quit path) must stop
+    # the agent, unwind asyncio, close audio, join the agent thread, then
+    # quit Qt. Without this, SIGINT lands as KeyboardInterrupt inside
+    # app.exec() and the process dies via SIGABRT.
+    shutdown_requested = False
+
+    def request_agent_stop():
+        for candidate in list(global_agent):
+            try:
+                candidate.request_stop()
+            except Exception:
+                pass
+
+    def handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        request_agent_stop()
+        QApplication.quit()
+
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    app.aboutToQuit.connect(request_agent_stop)
+
+    # Lets the interpreter service signals while app.exec() runs in C++.
+    wakeup_timer = QTimer()
+    wakeup_timer.timeout.connect(lambda: None)
+    wakeup_timer.start(250)
+
+    exit_code = app.exec()
+    agent_thread.join(timeout=15)
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
