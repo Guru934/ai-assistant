@@ -699,6 +699,12 @@ def start_agent_in_thread(volume_cb, quit_cb=None, text_cb=None, state_cb=None, 
         agent.run_loop(volume_cb, quit_cb, text_cb, state_cb, bubble_cb, glow_cb)
     )
     agent._run_task = task
+    # A stop requested before the task was published (request_stop() saw no
+    # task yet) would otherwise be missed: the flag alone cannot stop an
+    # uncooperative coroutine. Either request_stop() cancels the visible
+    # task, or this check cancels on its behalf - no interleaving escapes.
+    if agent.stop_event.is_set():
+        task.cancel()
     try:
         loop.run_until_complete(task)
     except (KeyboardInterrupt, asyncio.CancelledError):

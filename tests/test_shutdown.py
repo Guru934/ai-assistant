@@ -68,11 +68,18 @@ def test_request_stop_sets_flag_and_cancels_task():
 
 def test_start_agent_in_thread_cooperative_exit():
     """A run_loop that honors stop_event exits; the thread joins and the
-    agent is left stopped."""
+    agent is left stopped. The fake tolerates cancellation landing before
+    its first step (request_stop sets the flag AND cancels), so the test
+    is deterministic under any interleaving."""
     finished = []
+    started = threading.Event()
 
     async def fake_run_loop(self, *args, **kwargs):
-        await self.stop_event.wait()
+        started.set()
+        try:
+            await self.stop_event.wait()
+        except asyncio.CancelledError:
+            pass
         finished.append(True)
 
     with patch.object(GeminiDesktopAgent, "run_loop", fake_run_loop), \
@@ -85,7 +92,7 @@ def test_start_agent_in_thread_cooperative_exit():
         )
         thread.start()
         try:
-            assert _wait_for(lambda: bool(ref) and thread.is_alive()), \
+            assert _wait_for(lambda: bool(ref) and started.is_set()), \
                 "agent thread never started"
             ref[0].request_stop()
             thread.join(timeout=15)
