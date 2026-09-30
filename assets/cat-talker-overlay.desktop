@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Cat Talker Overlay
+GenericName=Desktop AI Assistant
+Comment=Cat Talker voice overlay: real-time Gemini voice companion with OS control
+Exec=/usr/bin/env PYTHONPATH=/home/guru/ai-assistant/src /home/guru/ai-assistant/.venv/bin/python -m cat_talker.main
+Path=/home/guru/ai-assistant
+Icon=/home/guru/ai-assistant/assets/avatar.png
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=cat-talker-overlay
