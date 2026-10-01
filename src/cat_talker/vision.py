@@ -10,6 +10,59 @@ from cat_talker.logging_config import get_logger
 
 logger = get_logger("cat_talker.vision")
 
+# Width (pixels) of every screenshot sent to Gemini. Aspect ratio is
+# preserved, so height varies. Gemini coordinates are defined in THIS image
+# space; image_to_screen_coords() maps them back to native desktop pixels.
+SCREENSHOT_WIDTH = 1024
+# Width for click-target inspections: extra detail for visual grounding.
+# Still aspect-preserved; geometry metadata makes the mapping exact, and the
+# model is always told the exact dimensions of the frame it receives.
+INSPECT_SHOT_WIDTH = 1536
+
+
+def image_to_screen_coords(x: float, y: float, geometry: Optional[Dict[str, Any]]):
+    """Map image-space pixels to native global desktop pixels.
+
+    geometry: {"img_w", "img_h", "src_w", "src_h", "x", "y"} as recorded by
+    capture_frame for the exact frame Gemini saw. src_* are the native pixel
+    dimensions of the captured source; x/y its global offset (never assumed
+    to be (0,0)). Returns (native_x, native_y), clamped to the source rect.
+    With no geometry, passes coordinates through unchanged.
+    """
+    if not geometry:
+        logger.warning("No capture geometry recorded; passing coordinates through")
+        return (int(x), int(y))
+    img_w = max(1, int(geometry.get("img_w") or 1))
+    img_h = max(1, int(geometry.get("img_h") or 1))
+    src_w = int(geometry.get("src_w") or img_w)
+    src_h = int(geometry.get("src_h") or img_h)
+    ox = int(geometry.get("x") or 0)
+    oy = int(geometry.get("y") or 0)
+    gx = ox + float(x) * src_w / img_w
+    gy = oy + float(y) * src_h / img_h
+    gx = min(max(gx, ox), ox + src_w)
+    gy = min(max(gy, oy), oy + src_h)
+    return (int(round(gx)), int(round(gy)))
+
+
+def image_to_global_layout(x: float, y: float, geometry: Optional[Dict[str, Any]]):
+    """Map image-space pixels to Hyprland GLOBAL LAYOUT coordinates.
+
+    Layout coordinates are logical pixels: the native (physical) mapping
+    divided by the monitor scale. hyprctl cursorpos reports layout coords
+    and hyprctl dispatch movecursor expects them. With scale=1 (or no
+    geometry) this equals the native mapping / passthrough.
+    """
+    if not geometry:
+        logger.warning("No capture geometry recorded; passing coordinates through")
+        return (int(x), int(y))
+    try:
+        scale = float(geometry.get("scale", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        scale = 1.0
+    px, py = image_to_screen_coords(x, y, geometry)
+    return (int(round(px / scale)), int(round(py / scale)))
+
 
 class VisionInterface:
     def __init__(self):
@@ -18,6 +71,9 @@ class VisionInterface:
         self.monitors: List[Dict[str, Any]] = []
         self.monitor_width = 1920
         self.monitor_height = 1080
+        # Geometry of the most recent frame sent to Gemini (see
+        # image_to_screen_coords). None until the first capture.
+        self.last_capture_geometry: Optional[Dict[str, Any]] = None
 
         self.refresh_monitors()
         if self.use_grim:
@@ -150,6 +206,29 @@ class VisionInterface:
         return self.get_active_monitor()
 
 
+    def image_to_screen(self, x, y, geometry=None):
+        """Instance helper: converts using the given geometry, defaulting to
+        the most recently captured frame."""
+        return image_to_screen_coords(x, y, geometry or self.last_capture_geometry)
+
+    def _record_capture(self, img_w: int, img_h: int, src_w: int, src_h: int,
+                        x: int = 0, y: int = 0, scale: float = 1.0) -> Dict[str, Any]:
+        """Remember the geometry of a frame sent to Gemini (see module
+        image_to_screen_coords / image_to_global_layout). src_*/x/y are
+        native (physical) pixels; scale converts to layout coordinates.
+        Returns the recorded dict."""
+        try:
+            scale = float(scale or 1.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        self.last_capture_geometry = {
+            "img_w": int(img_w), "img_h": int(img_h),
+            "src_w": int(src_w), "src_h": int(src_h),
+            "x": int(x), "y": int(y),
+            "scale": scale,
+        }
+        return self.last_capture_geometry
+
     def get_active_window_region(self) -> Optional[tuple[int, int, int, int]]:
         if not self.use_grim or not shutil.which("hyprctl"):
             return None
@@ -166,12 +245,15 @@ class VisionInterface:
             pass
         return None
 
-    def capture_frame(self, monitor: Optional[Union[str, int]] = None, region: Optional[tuple[int, int, int, int]] = None) -> Optional[bytes]:
+    def capture_frame(self, monitor: Optional[Union[str, int]] = None, region: Optional[tuple[int, int, int, int]] = None, target_width: int = SCREENSHOT_WIDTH) -> Optional[bytes]:
         """Captures a single frame for a specific monitor or entire desktop and returns JPEG bytes.
 
         Args:
             monitor: Monitor name ('eDP-1', 'HDMI-A-1'), monitor ID (0, 1), 'focused'/'active',
                      or 'all' for full virtual desktop.
+            region: Optional (x, y, w, h) crop in native pixels (grim only).
+            target_width: Output image width in pixels (aspect preserved).
+                     Use INSPECT_SHOT_WIDTH for click-target inspections.
         """
         target_mon = self._resolve_target_monitor(monitor)
 
@@ -188,8 +270,11 @@ class VisionInterface:
 
                     img_bgra = np.array(sct.grab(mon_rect))
                     orig_h, orig_w = img_bgra.shape[:2]
-                    target_width = 1024
-                    target_height = max(1, int(orig_h * (1024.0 / orig_w)))
+                    target_height = max(1, int(orig_h * (target_width / orig_w)))
+                    self._record_capture(
+                        target_width, target_height, orig_w, orig_h,
+                        int(mon_rect.get("left", 0)), int(mon_rect.get("top", 0)),
+                    )
 
                     resized = cv2.resize(img_bgra, (target_width, target_height))
                     bgr = cv2.cvtColor(resized, cv2.COLOR_BGRA2BGR)
@@ -222,8 +307,34 @@ class VisionInterface:
                     return None
 
                 orig_h, orig_w = img_bgr.shape[:2]
-                target_width = 1024
-                target_height = max(1, int(orig_h * (1024.0 / orig_w)))
+                target_height = max(1, int(orig_h * (target_width / orig_w)))
+                if region is not None:
+                    # Captured pixels ARE the region: native dims and offsets
+                    # come straight from it. Scale is the target monitor's
+                    # (region comes from its layout space).
+                    region_scale = 1.0
+                    if target_mon is not None:
+                        region_scale = float(target_mon.get("scale", 1.0) or 1.0)
+                    self._record_capture(
+                        target_width, target_height,
+                        int(region[2]), int(region[3]),
+                        int(region[0]), int(region[1]),
+                        scale=region_scale,
+                    )
+                elif target_mon is not None:
+                    # grim -o captures the output at physical pixels (what we
+                    # just measured). hyprctl offsets are logical, so scale
+                    # them; exact for scale=1.
+                    scale = float(target_mon.get("scale", 1.0) or 1.0)
+                    self._record_capture(
+                        target_width, target_height, orig_w, orig_h,
+                        int(round(target_mon.get("x", 0) * scale)),
+                        int(round(target_mon.get("y", 0) * scale)),
+                        scale=scale,
+                    )
+                else:
+                    self._record_capture(
+                        target_width, target_height, orig_w, orig_h, 0, 0)
 
                 resized = cv2.resize(img_bgr, (target_width, target_height))
                 _, encoded = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, 60])

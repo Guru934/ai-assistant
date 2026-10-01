@@ -211,26 +211,170 @@ def search_and_play_youtube(query: str) -> str:
     except Exception as e:
         return f"Failed to search and play YouTube: {e}"
 
-def click_screen(x: int, y: int) -> str:
+# --- Computer-use coordinate contract -------------------------------------
+# Gemini reports click targets in IMAGE space: pixels of the screenshot most
+# recently sent to it (1024 wide by default, 1536 for click-target
+# inspections; see cat_talker.vision). The agent records each sent frame's
+# geometry here; click_screen converts to global layout pixels before
+# touching the cursor. Never assume (0,0).
+_COORDINATE_GEOMETRY = None
+
+
+def set_coordinate_geometry(geometry):
+    """Remember the geometry of the frame Gemini is currently seeing."""
+    global _COORDINATE_GEOMETRY
+    _COORDINATE_GEOMETRY = dict(geometry) if geometry else None
+
+
+def get_coordinate_geometry():
+    return _COORDINATE_GEOMETRY
+
+
+def convert_click_coordinates(x: int, y: int):
+    """Map image-space (x, y) to native global desktop pixels.
+
+    Kept for non-Hyprland fallback. On Hyprland prefer
+    convert_click_to_global() (layout coordinates)."""
+    from cat_talker.vision import image_to_screen_coords
+    return image_to_screen_coords(x, y, get_coordinate_geometry())
+
+
+def convert_click_to_global(x: int, y: int):
+    """Map image-space (x, y) to Hyprland global layout coordinates."""
+    from cat_talker.vision import image_to_global_layout
+    return image_to_global_layout(x, y, get_coordinate_geometry())
+
+
+# Cursor verification tolerance, Hyprland layout pixels.
+CLICK_TOLERANCE_PX = 3
+
+
+def parse_cursorpos(text: str):
+    """Parse `hyprctl cursorpos` output ("X, Y") into (x, y) ints."""
+    parts = str(text).strip().split(",")
+    if len(parts) != 2:
+        raise ValueError(f"unexpected cursorpos output: {text!r}")
+    return (int(parts[0].strip()), int(parts[1].strip()))
+
+
+def _hyprland_available() -> bool:
+    return bool(shutil.which("hyprctl"))
+
+
+def _hyprctl_move_command(gx: int, gy: int):
+    """hyprctl argv moving the cursor to global layout (gx, gy).
+
+    Hyprland >= 0.56 routes dispatch through Lua: the legacy
+    `dispatch movecursor X Y` form fails with exit 7. The supported form is
+    a single Lua dispatcher object (verified live: cursor lands exactly).
+    gx/gy are ints by construction, so interpolation is injection-safe.
+    """
+    return ["hyprctl", "dispatch",
+            f"hl.dsp.cursor.move({{x = {int(gx)}, y = {int(gy)}}})"]
+
+
+def _hyprctl_failure(what: str, e: subprocess.CalledProcessError) -> str:
+    detail = ((e.stderr or "") + (e.stdout or "")).strip() or str(e)
+    return f"{what} failed (exit {e.returncode}): {detail}"
+
+
+def click_screen(x: int, y: int, target_description: str = "") -> str:
+    """Click at image-space coordinates x, y.
+
+    Args:
+        x: Horizontal pixel in the supplied screenshot (image space - use
+            the exact dimensions stated with that frame).
+        y: Vertical pixel in the supplied screenshot (image space).
+        target_description: Concise human-readable label of the visible UI
+            element you identified on the CURRENT screenshot (e.g. "History
+            link", "Play button"). Only describe what you actually see;
+            leave empty when unsure. Used ONLY for the spoken approval -
+            execution always uses the exact x/y above.
+        Grounding: locate the FULL clickable region first (thumbnail
+            rectangle, button, row) - never text edges, whitespace, borders,
+            overlays, scrollbars, or browser chrome unless requested. Click
+            INSIDE the region near its center. After clicking, inspect once
+            to verify; if the screen did not change, never reuse the same
+            coordinates - pick a different point only with fresh evidence
+            (max 2 alternates), then report failure to the user.
+    """
     def _execute(x, y):
         try:
+            if _hyprland_available():
+                # Deterministic compositor-side move. ydotool absolute
+                # movement does not land on Hyprland, so it is NOT used here;
+                # ydotool only performs the button press after verification.
+                gx, gy = convert_click_to_global(x, y)
+                try:
+                    subprocess.run(
+                        _hyprctl_move_command(gx, gy),
+                        capture_output=True, text=True, check=True, timeout=10,
+                    )
+                except subprocess.CalledProcessError as e:
+                    return (_hyprctl_failure(
+                                f"Cursor move to global ({gx}, {gy}) [image ({x}, {y})]",
+                                e) + ". Click NOT sent.")
+                except Exception as e:
+                    return (f"Cursor move to global ({gx}, {gy}) [image ({x}, {y})] "
+                            f"failed: {e}. Click NOT sent.")
+                try:
+                    query = subprocess.run(
+                        ["hyprctl", "cursorpos"],
+                        capture_output=True, text=True, check=True, timeout=10,
+                    )
+                    ax, ay = parse_cursorpos(query.stdout)
+                except subprocess.CalledProcessError as e:
+                    return (_hyprctl_failure(
+                                f"Cursor position verification for global ({gx}, {gy}) "
+                                f"[image ({x}, {y})]",
+                                e) + ". Click NOT sent.")
+                except Exception as e:
+                    return (f"Cursor move to global ({gx}, {gy}) [image ({x}, {y})] "
+                            f"requested, but position verification unavailable: {e}. "
+                            f"Click NOT sent.")
+                if abs(ax - gx) > CLICK_TOLERANCE_PX or abs(ay - gy) > CLICK_TOLERANCE_PX:
+                    return (f"Cursor move to global ({gx}, {gy}) failed verification: "
+                            f"actual ({ax}, {ay}), tolerance {CLICK_TOLERANCE_PX}px. "
+                            f"Click NOT sent.")
+                if not shutil.which("ydotool"):
+                    return (f"Cursor verified at ({ax}, {ay}), but ydotool not found. "
+                            f"Click NOT sent.")
+                try:
+                    subprocess.run(["ydotool", "click", "0xC0"], check=True)
+                except Exception as e:
+                    return (f"Cursor verified at ({ax}, {ay}) for global ({gx}, {gy}) "
+                            f"[image ({x}, {y})], but the click failed: {e}.")
+                return (f"OS click dispatched at global ({gx}, {gy}) [image ({x}, {y})], "
+                        f"cursor verified at ({ax}, {ay}) within {CLICK_TOLERANCE_PX}px. "
+                        f"Target UI success NOT verified - "
+                        f"call inspect_screen once to confirm the UI changed.")
+            # Non-Hyprland fallback (pre-existing ydotool absolute path).
+            nx, ny = convert_click_coordinates(x, y)
             if shutil.which("ydotool"):
-                subprocess.run(["ydotool", "mousemove", "--absolute", str(x), str(y)], check=True)
+                subprocess.run(["ydotool", "mousemove", "--absolute", str(nx), str(ny)], check=True)
                 subprocess.run(["ydotool", "click", "0xC0"], check=True)
-                return f"Clicked at coordinate '{x}, {y}'"
+                return (f"OS click dispatched at native ({nx}, {ny}) "
+                        f"[image ({x}, {y})]. Target success NOT verified - "
+                        f"call inspect_screen once to confirm the UI changed.")
             return "Error: ydotool not found."
         except Exception as e:
             return f"Failed to click: {e}"
-    return _handle_risky("click_screen", _execute, {"x": x, "y": y}, f"click at {x}, {y}")
+    # Approval wording is semantic (never raw coordinates - the user cannot
+    # identify "73, 633" by voice). The exact x/y stay bound in args, so
+    # confirmation executes precisely the originally selected coordinates.
+    target = (target_description or "").strip()
+    desc = f"click the {target}" if target else "click the selected screen location"
+    return _handle_risky("click_screen", _execute, {"x": x, "y": y}, desc)
 
 def type_text(text: str) -> str:
     def _execute(text):
         try:
             if shutil.which("ydotool"):
-                p = subprocess.Popen(["ydotool", "type", text])
-                p.wait()
+                subprocess.run(["ydotool", "type", text], check=True)
                 return f"Successfully typed: {text}"
             return "Error: ydotool not found."
+        except subprocess.CalledProcessError as e:
+            return f"Failed to type (ydotool exit {e.returncode}): {e}"
         except Exception as e:
             return f"Failed to type: {e}"
     return _handle_risky("type_text", _execute, {"text": text}, f"type \"{text}\"")
@@ -370,9 +514,12 @@ def send_notification(title: str, body: str) -> str:
 
 def inspect_screen(query: str = "", monitor: str = "") -> str:
     """Takes a crisp desktop screenshot to analyze errors, documents, or websites.
-    
+
     This magic string tells the agent loop to fetch a frame and send it to Gemini.
-    
+    Use ONCE after a click to verify the UI changed; do not inspect the same
+    unchanged screen repeatedly. If a click did not change the screen, treat
+    it as failed and choose a different point with fresh visual evidence.
+
     Args:
         query: What you are looking for on the screen (used for your internal context).
         monitor: Monitor name (e.g. 'eDP-1'), ID (e.g. '0'), 'focused', or 'all' for full desktop.

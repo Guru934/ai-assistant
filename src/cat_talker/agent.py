@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import threading
 import time
 import json
@@ -53,6 +54,47 @@ def canonical_tool_signature(name, args):
         canon = repr(args)
     return f"{name}({canon})"
 
+
+def build_system_instructions():
+    """System prompt: coordinate contract + visual grounding rules.
+
+    Pure function (no self/vision dependency) so tests can assert the
+    contract wording directly.
+    """
+    return (
+        "You are 'Chibi', a cheerful, cute, and ultra-helpful desktop AI companion. "
+        "You have direct access to the user's computer via tools! You can open apps, open websites in browser, "
+        "read the clipboard (including currently highlighted text via primary_selection=True), check the active window, set the volume, set brightness, take screenshots, "
+        "control media, switch workspaces, and send notifications. "
+        "YOU HAVE VISION ON DEMAND - when the user asks you to look at something, use the take_screenshot tool "
+        "to capture the screen and analyze it. "
+        "COORDINATE CONTRACT: every screenshot states its EXACT pixel dimensions (e.g. 1536x960). "
+        "Always output x, y in THAT supplied image's pixel coordinates - never any fixed grid, never native "
+        "screen pixels. The system converts image coordinates to screen coordinates - never convert yourself. "
+        "Use click_screen(x,y) with image pixels plus a truthful target_description. "
+        "GROUNDING RULES: NEVER infer a UI element's location from memory or common website layouts. "
+        "NEVER assume a target (like YouTube History) sits at a fixed coordinate. NEVER reuse a previous "
+        "coordinate just because the target has the same name - always locate the target in the CURRENT "
+        "supplied screenshot. First identify the complete clickable region, then choose a point safely INSIDE "
+        "it, preferably near its center - never a text edge, whitespace next to the target, a border between "
+        "adjacent elements, an overlay, a scrollbar, or browser chrome unless that is the requested target. "
+        "For a video thumbnail: find the thumbnail rectangle first, then click inside it. For a sidebar/menu "
+        "item: identify the row bounds, the label position, and the neighboring rows, then ask which rectangle "
+        "contains the requested label - reason about the rectangle, not about where the item usually lives. "
+        "Choose a point comfortably inside that row. If the target cannot be confidently localized from the "
+        "current frame, do NOT guess coordinates. "
+        "After a click, call inspect_screen ONCE to verify the result; do not inspect repeatedly without acting. "
+        "A changed screen alone does NOT prove the requested target was activated - only claim target success "
+        "with visible evidence in the new frame. If the screen did not change as intended, treat the click as "
+        "failed: NEVER reuse the same coordinates - re-analyze the fresh frame and pick a different point only "
+        "with new evidence. Maximum 2 alternate attempts per target; then tell the user the target could not "
+        "be reliably located. "
+        "When asked to open something or perform an OS task, ALWAYS execute the appropriate tool function. "
+        "Never say you cannot see or control the PC. Use your tools immediately to fulfill the request! "
+            "If the user asks to format/fix highlighted text, use get_clipboard(primary_selection=True), process it, and use set_clipboard(text) to copy the result."
+    )
+
+
 class GeminiDesktopAgent:
     def __init__(self):
         self.client = genai.Client()
@@ -79,6 +121,19 @@ class GeminiDesktopAgent:
         # output has started since. Cooldown after drain, before re-enable.
         self._output_epoch = 0
         self._mic_release_cooldown = 0.5
+        # Screen-inspection guard: hash of the last frame sent to Gemini and
+        # whether a desktop action has dirtied the screen since. Prevents
+        # inspect_screen tight loops over an unchanged screen.
+        self._last_frame_hash = None
+        self._screen_dirty = True
+        # Click verification policy: the last executed click awaiting its
+        # post-click inspection, image coords that already failed
+        # verification this interaction, and the failed-verification count.
+        # Enforces: never reuse failed coords, max 2 alternate attempts per
+        # target, then tell the user instead of guessing.
+        self._pending_click = None
+        self._failed_coords = set()
+        self._click_failures = 0
 
     def _set_state(self, state_callback, state: str):
         if state_callback:
@@ -176,20 +231,8 @@ class GeminiDesktopAgent:
         model = "gemini-3.8-live"
         logger.info(f"Connecting to Gemini Live API with model: {model}")
 
-        system_instructions = (
-            "You are 'Chibi', a cheerful, cute, and ultra-helpful desktop AI companion. "
-            "You have direct access to the user's computer via tools! You can open apps, open websites in browser, "
-            "read the clipboard (including currently highlighted text via primary_selection=True), check the active window, set the volume, set brightness, take screenshots, "
-            "control media, switch workspaces, and send notifications. "
-            "YOU HAVE VISION ON DEMAND - when the user asks you to look at something, use the take_screenshot tool "
-            "to capture the screen and analyze it. "
-            f"To click something on the screen, intelligently guess the X, Y coordinate based on the exact screen "
-            f"resolution of {self.vision.monitor_width}x{self.vision.monitor_height}. You MUST output absolute pixel "
-            "coordinates mapping to this grid and use the click_screen(x,y) tool. "
-            "When asked to open something or perform an OS task, ALWAYS execute the appropriate tool function. "
-            "Never say you cannot see or control the PC. Use your tools immediately to fulfill the request! "
-            "If the user asks to format/fix highlighted text, use get_clipboard(primary_selection=True), process it, and use set_clipboard(text) to copy the result."
-        )
+
+        system_instructions = build_system_instructions()
 
         try:
             while not self.stop_event.is_set():
@@ -216,6 +259,13 @@ class GeminiDesktopAgent:
                         self._clear_input_queue()
                         self._session_generation += 1
                         self._session_active.set()
+                        # Fresh session: allow inspection; no frame seen yet.
+                        # Click retry policy restarts clean as well.
+                        self._screen_dirty = True
+                        self._last_frame_hash = None
+                        self._pending_click = None
+                        self._failed_coords = set()
+                        self._click_failures = 0
 
                         logger.info("====================================")
                         logger.info("✅ Session established securely!")
@@ -349,8 +399,16 @@ class GeminiDesktopAgent:
                                                     # New user turn: semantic dedup
                                                     # starts over (ID dedup stays
                                                     # per-session by design).
+                                                    # Inspection is allowed
+                                                    # again for the new turn.
+                                                    # Click retry policy restarts.
                                                     self._interaction_id += 1
                                                     seen_signatures.clear()
+                                                    self._screen_dirty = True
+                                                    self._last_frame_hash = None
+                                                    self._pending_click = None
+                                                    self._failed_coords = set()
+                                                    self._click_failures = 0
 
                                             if msg.server_content.model_turn:
                                                 # Model started responding - thinking phase
@@ -389,6 +447,11 @@ class GeminiDesktopAgent:
                                                     # as voice transcription.
                                                     self._interaction_id += 1
                                                     seen_signatures.clear()
+                                                    self._screen_dirty = True
+                                                    self._last_frame_hash = None
+                                                    self._pending_click = None
+                                                    self._failed_coords = set()
+                                                    self._click_failures = 0
 
                                         if hasattr(msg, "tool_call") and msg.tool_call:
                                             from cat_talker.tools import ALL_TOOLS
@@ -401,6 +464,9 @@ class GeminiDesktopAgent:
                                                 args = function_call.args if hasattr(function_call, "args") and function_call.args else {}
                                                 sig = canonical_tool_signature(function_call.name, args)
                                                 result_dict = {"error": "Function not found"}
+                                                # Blocked (guidance-only) calls answer the protocol
+                                                # but record no side effect and dirty nothing.
+                                                record_side_effect = True
                                                 if call_id is not None and call_id in seen_tool_call_ids:
                                                     logger.debug(
                                                         "🛠️ Tool call interaction=%d name=%s id=%s sig=%s "
@@ -421,6 +487,36 @@ class GeminiDesktopAgent:
                                                         call_id, sig,
                                                     )
                                                     result_dict = seen_signatures[sig]
+                                                elif function_call.name == "click_screen" and isinstance(args, dict) and (
+                                                        (args.get("x"), args.get("y")) in self._failed_coords):
+                                                    logger.info(
+                                                        "🛠️ Tool call interaction=%d name=%s id=%s sig=%s "
+                                                        "classification=BLOCKED_RETRY",
+                                                        self._interaction_id, function_call.name,
+                                                        call_id, sig,
+                                                    )
+                                                    result_dict = {"result": (
+                                                        f"Click at image ({args.get('x')}, {args.get('y')}) BLOCKED: "
+                                                        f"this exact point already failed verification (the screen "
+                                                        f"did not change). Re-analyze the LATEST inspection frame "
+                                                        f"and choose a DIFFERENT point inside the target region, "
+                                                        f"near its center - or call inspect_screen once for a "
+                                                        f"fresh frame. Do not reuse failed coordinates.")}
+                                                    record_side_effect = False
+                                                elif function_call.name == "click_screen" and self._click_failures >= 2:
+                                                    desc = args.get("target_description", "") if isinstance(args, dict) else ""
+                                                    logger.info(
+                                                        "🛠️ Tool call interaction=%d name=%s id=%s sig=%s "
+                                                        "classification=BLOCKED_UNRELIABLE",
+                                                        self._interaction_id, function_call.name,
+                                                        call_id, sig,
+                                                    )
+                                                    result_dict = {"result": (
+                                                        f"Click target '{desc or 'the requested target'}' could not be "
+                                                        f"reliably located after multiple attempts. STOP guessing "
+                                                        f"coordinates. Tell the user out loud what you see on the "
+                                                        f"screen and ask them to describe the target differently.")}
+                                                    record_side_effect = False
                                                 elif function_call.name in tool_func_map:
                                                     logger.info(
                                                         "🛠️ Tool call interaction=%d name=%s id=%s sig=%s "
@@ -457,27 +553,112 @@ class GeminiDesktopAgent:
                                                             self._set_glow(glow_callback, "vision")
                                                             # Capture frame and send to Gemini for analysis
                                                             try:
+                                                                from cat_talker.vision import INSPECT_SHOT_WIDTH
                                                                 monitor_arg = args.get("monitor", "") if isinstance(args, dict) else ""
-                                                                frame = self.vision.capture_frame(monitor=monitor_arg)
+                                                                frame = self.vision.capture_frame(
+                                                                    monitor=monitor_arg,
+                                                                    target_width=INSPECT_SHOT_WIDTH)
                                                                 if frame:
+                                                                    import cat_talker.tools as _tools_mod
+                                                                    _tools_mod.set_coordinate_geometry(
+                                                                        getattr(self.vision, "last_capture_geometry", None))
                                                                     async with send_lock:
                                                                         await session.send_realtime_input(
                                                                             video=types.Blob(data=frame, mime_type='image/jpeg')
                                                                         )
-                                                                self._set_bubble(bubble_callback, "📸 Screenshot captured and sent to Gemini")
+                                                                    self._set_bubble(bubble_callback, "📸 Screenshot captured and sent to Gemini")
                                                             except Exception as e:
                                                                 logger.error(f"Screenshot send error: {e}", exc_info=True)
                                                             # For now, the model will respond based on the tool result text
                                                         if function_call.name == "inspect_screen":
                                                             try:
+                                                                from cat_talker.vision import INSPECT_SHOT_WIDTH
                                                                 monitor_arg = args.get("monitor", "") if isinstance(args, dict) else ""
-                                                                frame = self.vision.capture_frame(monitor=monitor_arg)
+                                                                frame = self.vision.capture_frame(
+                                                                    monitor=monitor_arg,
+                                                                    target_width=INSPECT_SHOT_WIDTH)
                                                                 if frame:
-                                                                    async with send_lock:
-                                                                        await session.send_realtime_input(
-                                                                            video=types.Blob(data=frame, mime_type='image/jpeg')
+                                                                    import cat_talker.tools as _tools_mod
+                                                                    geom = getattr(self.vision, "last_capture_geometry", None)
+                                                                    _tools_mod.set_coordinate_geometry(geom)
+                                                                    frame_sig = None
+                                                                    if isinstance(frame, (bytes, bytearray)):
+                                                                        frame_sig = hashlib.sha256(frame).hexdigest()[:16]
+                                                                    if (not self._screen_dirty and frame_sig is not None
+                                                                            and frame_sig == self._last_frame_hash):
+                                                                        logger.debug(
+                                                                            "inspect_screen skipped: screen unchanged "
+                                                                            "since last inspection"
                                                                         )
-                                                                    self._set_bubble(bubble_callback, "📸 Screen analyzed by Gemini")
+                                                                        result = ("Screen unchanged since last inspection; "
+                                                                                  "no new frame sent. Act on the previous "
+                                                                                  "frame or call a desktop action first.")
+                                                                    else:
+                                                                        async with send_lock:
+                                                                            await session.send_realtime_input(
+                                                                                video=types.Blob(data=frame, mime_type='image/jpeg')
+                                                                            )
+                                                                        self._screen_dirty = False
+                                                                        pending = self._pending_click
+                                                                        self._pending_click = None
+                                                                        verify_note = ""
+                                                                        if (pending is not None
+                                                                                and pending.get("base") is not None
+                                                                                and frame_sig is not None
+                                                                                and frame_sig == pending["base"]):
+                                                                            # Click verification FAILED: the
+                                                                            # post-click screen matches the
+                                                                            # pre-click screen.
+                                                                            self._failed_coords.add(
+                                                                                (pending.get("x"), pending.get("y")))
+                                                                            self._click_failures += 1
+                                                                            logger.info(
+                                                                                f"Click verification FAILED for "
+                                                                                f"'{pending.get('desc') or 'target'}' at "
+                                                                                f"image ({pending.get('x')}, {pending.get('y')}): "
+                                                                                f"screen unchanged."
+                                                                            )
+                                                                            verify_note = (
+                                                                                f" Note: the previous click at image "
+                                                                                f"({pending.get('x')}, {pending.get('y')}) "
+                                                                                f"did NOT change the screen - treat it as "
+                                                                                f"unsuccessful and do NOT reuse those "
+                                                                                f"coordinates.")
+                                                                        else:
+                                                                            # Screen changed (or no baseline to compare):
+                                                                            # this is NOT target success. Only an unchanged
+                                                                            # screen is a proven failure; a changed screen
+                                                                            # still needs the model's explicit evidence that
+                                                                            # the REQUESTED target was activated. Budget is
+                                                                            # intentionally not reset here.
+                                                                            if pending is not None:
+                                                                                logger.info(
+                                                                                    "Screen changed after the click, but target "
+                                                                                    "activation is NOT confirmed."
+                                                                                )
+                                                                                verify_note = (
+                                                                                    f" Verification required: did this click "
+                                                                                    f"successfully activate "
+                                                                                    f"'{pending.get('desc') or 'the requested target'}'? "
+                                                                                    f"Only claim success with visible evidence in "
+                                                                                    f"the NEW frame above. If the requested target/page "
+                                                                                    f"is not visibly active, treat the click as "
+                                                                                    f"unsuccessful.")
+                                                                        self._last_frame_hash = frame_sig
+                                                                        iw = (geom or {}).get("img_w", "?")
+                                                                        ih = (geom or {}).get("img_h", "?")
+                                                                        logger.info(
+                                                                            f"📸 Inspection sent ({iw}x{ih} image px, "
+                                                                            f"frame {frame_sig})"
+                                                                        )
+                                                                        self._set_bubble(bubble_callback, "📸 Screen analyzed by Gemini")
+                                                                        xmax = iw - 1 if isinstance(iw, int) else "?"
+                                                                        ymax = ih - 1 if isinstance(ih, int) else "?"
+                                                                        result = (f"Screen frame sent ({iw}x{ih} image pixels). "
+                                                                                  "Report click targets in THESE image-pixel "
+                                                                                  f"coordinates (0-{xmax} horizontally, 0-{ymax} vertically). "
+                                                                                  "Use the dimensions stated here, not any fixed grid."
+                                                                                  + verify_note)
                                                             except Exception as e:
                                                                 logger.error(f"Inspect screen error: {e}", exc_info=True)
 
@@ -492,13 +673,31 @@ class GeminiDesktopAgent:
                                                             logger.info(f"🛠️ Executed {function_call.name}: {result}")
 
                                                         result_dict = {"result": result}
+                                                        if function_call.name == "click_screen" and isinstance(args, dict):
+                                                            # Record executed clicks for post-click
+                                                            # verification: only real dispatches
+                                                            # (never pauses, errors, or skips).
+                                                            if (isinstance(result, str)
+                                                                    and "dispatched at" in result
+                                                                    and "NOT sent" not in result):
+                                                                self._pending_click = {
+                                                                    "x": args.get("x"),
+                                                                    "y": args.get("y"),
+                                                                    "desc": args.get("target_description", ""),
+                                                                    "base": self._last_frame_hash,
+                                                                }
                                                     except Exception as err:
                                                         result_dict = {"error": str(err)}
 
                                                     if call_id is not None:
                                                         seen_tool_call_ids[call_id] = result_dict
-                                                    if function_call.name in SIDE_EFFECT_TOOLS:
+                                                    if record_side_effect and function_call.name in SIDE_EFFECT_TOOLS:
                                                         seen_signatures[sig] = result_dict
+                                                        # A desktop action changed
+                                                        # (or may have changed) the UI:
+                                                        # the next inspection is fresh.
+                                                        self._screen_dirty = True
+
 
                                                 responses.append(types.FunctionResponse(
                                                     id=function_call.id,
@@ -552,6 +751,9 @@ class GeminiDesktopAgent:
                                             region = self.vision.get_active_window_region()
                                             frame = self.vision.capture_frame(region=region)
                                             if frame:
+                                                import cat_talker.tools as _tools_mod
+                                                _tools_mod.set_coordinate_geometry(
+                                                    getattr(self.vision, "last_capture_geometry", None))
                                                 self._set_bubble(bubble_callback, "📸 Captured Active Window")
                                                 self._set_glow(glow_callback, "vision")
                                                 async with send_lock:
