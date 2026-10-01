@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""F2 control/launcher for the AI Assistant (Hyprland global shortcut).
+
+Usage: assistant-control [toggle|wake|sleep|status|ui-toggle|ui-show|ui-hide|stop]
+  (default: toggle)
+
+If the assistant answers on its control socket, the command is forwarded
+to the RUNNING instance (works hidden, unfocused, or while sleeping).
+Otherwise exactly one instance is launched (lock-guarded, stale sockets
+detected via refused connections - never killall/pkill).
+
+Test hooks (env): CAT_TALKER_RUNTIME_DIR overrides the socket/lock dir;
+CAT_TALKER_SPAWN_ARGV_JSON overrides the spawned process argv.
+"""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from cat_talker.control import lock_path, send_command, socket_path
+
+SPAWN_WAIT_S = 15.0
+LOCK_TIMEOUT_S = 10.0
+
+
+def _runtime_dir():
+    return os.environ.get("CAT_TALKER_RUNTIME_DIR")
+
+
+def _spawn_argv():
+    override = os.environ.get("CAT_TALKER_SPAWN_ARGV_JSON")
+    if override:
+        return json.loads(override)
+    return [
+        os.path.join(ROOT, ".venv", "bin", "python"),
+        "-m", "cat_talker.main",
+    ]
+
+
+def _try_forward(cmd, path):
+    try:
+        return send_command(cmd, path=path, timeout=3.0)
+    except (OSError, ValueError):
+        return None
+
+
+def _wait_for_socket(path, deadline):
+    while time.monotonic() < deadline:
+        reply = _try_forward("status", path)
+        if reply is not None and reply.get("ok"):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _launch_once(path):
+    argv = _spawn_argv()
+    # Fully absolute child environment: works from any caller CWD
+    # (Hyprland has none). Same command as a terminal launch:
+    #   cd /home/guru/ai-assistant (ROOT)
+    #   PYTHONPATH=<ROOT>/src <ROOT>/.venv/bin/python -m cat_talker.main
+    child_env = dict(os.environ)
+    child_env["PYTHONPATH"] = os.path.join(ROOT, "src") + (
+        os.pathsep + child_env["PYTHONPATH"]
+        if child_env.get("PYTHONPATH") else ""
+    )
+    log = os.path.join(
+        _runtime_dir()
+        or os.environ.get("XDG_RUNTIME_DIR")
+        or os.path.join(os.path.expanduser("~"), ".cache", "cat-talker"),
+        "assistant-control-spawn.log",
+    )
+    os.makedirs(os.path.dirname(log), exist_ok=True)
+    with open(log, "ab") as out:
+        subprocess.Popen(
+            argv,
+            cwd=ROOT,
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return _wait_for_socket(path, time.monotonic() + SPAWN_WAIT_S)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "toggle"
+    if cmd not in ("toggle", "wake", "sleep", "status",
+                   "ui-toggle", "ui-show", "ui-hide", "stop"):
+        print("usage: assistant-control "
+              "[toggle|wake|sleep|status|ui-toggle|ui-show|ui-hide|stop]",
+              file=sys.stderr)
+        return 2
+    runtime = _runtime_dir()
+    path = socket_path(runtime)
+    reply = _try_forward(cmd, path)
+    if reply is not None and reply.get("ok"):
+        print(reply.get("state", "ok"))
+        return 0
+    if cmd == "stop":
+        # Nothing to stop: never launch a process just to quit it.
+        print("not running")
+        return 0
+
+    # Not answering: take the spawn lock, recheck (another launcher may
+    # have won), drop a stale socket, start exactly one instance.
+    lockf = lock_path(runtime)
+    with open(lockf, "a+b") as lock:
+        deadline = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    print("assistant-control: spawn lock busy",
+                          file=sys.stderr)
+                    return 1
+                time.sleep(0.1)
+        try:
+            reply = _try_forward(cmd, path)
+            if reply is not None and reply.get("ok"):
+                print(reply.get("state", "ok"))
+                return 0
+            # Refused/missing: stale file from a dead instance?
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            if not _launch_once(path):
+                print("assistant-control: assistant did not come up",
+                      file=sys.stderr)
+                return 1
+            reply = _try_forward(cmd, path)
+            if reply is not None and reply.get("ok"):
+                print(reply.get("state", "ok"))
+                return 0
+            print("assistant-control: command not acknowledged",
+                  file=sys.stderr)
+            return 1
+        finally:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

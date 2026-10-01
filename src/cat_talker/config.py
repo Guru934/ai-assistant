@@ -14,6 +14,7 @@ DEFAULT_CONFIG = {
     "preferred_monitor": "",
     "auto_reconnect": True,
     "voice_approval_enabled": True,
+    "echo_suppress_enabled": True,
 }
 
 
@@ -86,6 +87,20 @@ def get_voice_approval() -> bool:
     """Get voice approval enabled setting."""
     config = load_config()
     return config.get("voice_approval_enabled", True)
+
+
+def get_echo_suppress() -> bool:
+    """Get echo-suppression-of-speaker-audio setting (default on)."""
+    config = load_config()
+    return config.get("echo_suppress_enabled", True)
+
+
+def set_echo_suppress(enabled: bool) -> str:
+    """Enable/disable echo suppression and save config."""
+    config = load_config()
+    config["echo_suppress_enabled"] = enabled
+    result = save_config(config)
+    return result
 
 
 def set_voice_approval(enabled: bool) -> str:

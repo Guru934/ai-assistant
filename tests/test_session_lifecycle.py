@@ -42,6 +42,7 @@ class FakeAudio:
         self.is_playing = False
         self.suppress_calls = 0
         self.release_calls = 0
+        self.input_paused = False
 
     def queue_output(self, data):
         self.output.append(data)
@@ -56,6 +57,12 @@ class FakeAudio:
     def release_mic(self):
         self.release_calls += 1
         self.is_playing = False
+
+    def pause_input(self):
+        self.input_paused = True
+
+    def resume_input(self):
+        self.input_paused = False
 
     def close(self):
         pass
@@ -230,6 +237,8 @@ def make_agent():
         agent = GeminiDesktopAgent()
     agent.audio = FakeAudio()
     agent.vision = MagicMock()
+    # Contract: agents start SLEEPING; session-driving tests wake first.
+    assert agent.request_wake() == "awake"
     return agent
 
 
@@ -537,6 +546,7 @@ def test_reconnect_reuses_audio_interface():
          patch.object(agent_mod, "play_earcon", MagicMock()):
         agent = GeminiDesktopAgent()
         assert agent.audio is None
+        assert agent.request_wake() == "awake"  # startup is SLEEPING
         bad = FakeSession(exc=RuntimeError("drop"))
         good = FakeSession(hang=True)
         count = wire_connect(agent, [bad, good])

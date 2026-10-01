@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pyaudio
 
 from cat_talker.audio import AudioInterface
+from cat_talker.echo_suppress import EchoSuppressor
 
 
 class FakeLoop:
@@ -45,6 +46,13 @@ def _bare_iface(**overrides):
     iface.volume_cb = None
     iface.audio_out_queue = queue.Queue()
     iface.out_stream = FakeOutStream()
+    # Echo-suppression collaborators (same defaults as __init__): a real
+    # suppressor, enabled. Odd-size test chunks bypass it by size guard,
+    # so these tests exercise the hook without altering expectations.
+    iface._echo_enabled = True
+    iface.echo = EchoSuppressor(enabled=True)
+    iface._last_echo_decision = None
+    iface._playback_chunks = 0
     for key, value in overrides.items():
         setattr(iface, key, value)
     return iface

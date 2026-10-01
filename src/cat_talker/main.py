@@ -1,16 +1,19 @@
 import sys
 import os
 import signal
-os.environ["QT_QPA_PLATFORM"] = "xcb"  # Force X11 for dragging/snapping to work on Wayland/Hyprland
+# X11 for dragging/snapping on Wayland/Hyprland; a pre-set platform (e.g.
+# offscreen for tests) is honored.
+os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 import datetime
 import threading
 import math
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import QWidget, QMenu, QMessageBox, QLabel, QVBoxLayout
 from PyQt6.QtGui import QPainter, QColor, QBrush, QAction, QPen, QFont, QPainterPath, QPixmap
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPointF, QEasingCurve, QPropertyAnimation, pyqtProperty
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, QPointF, QEasingCurve, QPropertyAnimation, pyqtProperty
 
 from cat_talker.agent import start_agent_in_thread
+from cat_talker.control import serve_forever
 from cat_talker.dictation import DictationManager
 from cat_talker.logging_config import get_logger
 
@@ -32,7 +35,23 @@ class RadialVisualizerWindow(QWidget):
     glow_signal = pyqtSignal(str)                  # connected|processing|vision|thinking
 
     def __init__(self):
+        import os as _os
+        import threading as _threading
         super().__init__()
+        # DEBUG-only lifecycle trace (no continuous logging, events only).
+        logger.debug(
+            "ui lifecycle: constructed RadialVisualizerWindow id=%s "
+            "pid=%s thread=%s top_level=%d",
+            id(self), _os.getpid(), _threading.current_thread().name,
+            len(QApplication.topLevelWidgets()) if QApplication.instance()
+            else -1,
+        )
+        try:
+            self.destroyed.connect(
+                lambda obj=None: logger.debug(
+                    "ui lifecycle: destroyed RadialVisualizerWindow"))
+        except Exception:
+            pass
         
         # Audio state
         self.volume = 0.0
@@ -334,6 +353,21 @@ class RadialVisualizerWindow(QWidget):
 
         painter.end()
 
+    # ─── Lifecycle tracing (DEBUG only, events only) ──────────────
+    def showEvent(self, event):
+        logger.debug("ui lifecycle: show id=%s visible=%s top_level=%d",
+                     id(self), self.isVisible(),
+                     len(QApplication.topLevelWidgets()))
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        logger.debug("ui lifecycle: hide id=%s", id(self))
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        logger.debug("ui lifecycle: close id=%s", id(self))
+        super().closeEvent(event)
+
     # ─── Mouse Drag ──────────────────────────────────────────────
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -389,31 +423,44 @@ class RadialVisualizerWindow(QWidget):
         self._drag_pos = None
         self._snap_to_nearest_edge()
 
-    def contextMenuEvent(self, event):
+    def _build_context_menu(self):
+        """Build the right-click menu; returns (menu, actions by key).
+
+        Extracted (no behavior change) so the wiring is testable without
+        running the modal event loop. NOTE: the old "Mute Microphone"
+        item is gone - its handler only ever showed an "Integration
+        pending" popup, i.e. it was an unimplemented dead end.
+        """
         menu = QMenu(self)
-        
+
         # Pinning
         pin_text = "📌 Unpin from Top" if self.always_on_top else "📌 Pin to Top"
         act_pin = menu.addAction(pin_text)
-        
-        # Muting
-        mute_text = "🔊 Unmute Microphone" if self.is_muted else "🔇 Mute Microphone"
-        act_mute = menu.addAction(mute_text)
-        
+
         menu.addSeparator()
-        
+
         act_bottom_center = menu.addAction("📍 Snap to Bottom Center")
         act_bottom_right = menu.addAction("📍 Snap to Bottom Right")
         act_center = menu.addAction("📍 Snap to Center")
         menu.addSeparator()
-        
-        act_hide = menu.addAction("👁️ Toggle Vis (pkill -SIGUSR1)")
+
+        act_hide = menu.addAction("👁️ Hide UI")
         act_capture = menu.addAction("📸 Capture Active Window (pkill -SIGUSR2)")
         act_quit = menu.addAction("❌ Quit Assistant")
 
-        action = menu.exec(event.globalPos())
+        actions = {
+            "pin": act_pin,
+            "bottom_center": act_bottom_center,
+            "bottom_right": act_bottom_right,
+            "center": act_center,
+            "hide": act_hide,
+            "capture": act_capture,
+            "quit": act_quit,
+        }
+        return menu, actions
 
-        if action == act_pin:
+    def _handle_menu_action(self, action, actions):
+        if action == actions["pin"]:
             self.always_on_top = not self.always_on_top
             flags = self.windowFlags()
             if self.always_on_top:
@@ -422,26 +469,141 @@ class RadialVisualizerWindow(QWidget):
                 flags &= ~Qt.WindowType.WindowStaysOnTopHint
             self.setWindowFlags(flags)
             self.show()
-        elif action == act_mute:
-            self.is_muted = not self.is_muted
-            # Emit a signal or directly update config (we'll emit a global signal or handle it later)
-            QMessageBox.information(self, "Mute", "Mute toggled! (Integration pending)")
-        elif action == act_bottom_center:
+        elif action == actions["bottom_center"]:
             self.position_bottom_center()
-        elif action == act_bottom_right:
+        elif action == actions["bottom_right"]:
             self.position_bottom_right()
-        elif action == act_center:
+        elif action == actions["center"]:
             self.position_center()
-        elif action == act_hide:
+        elif action == actions["hide"]:
             self.hide()
-        elif action == act_capture:
+        elif action == actions["capture"]:
             # Re-use the existing logic by sending SIGUSR2 to ourselves
             os.kill(os.getpid(), signal.SIGUSR2)
-        elif action == act_quit:
+        elif action == actions["quit"]:
             QApplication.quit()
 
+    def contextMenuEvent(self, event):
+        menu, actions = self._build_context_menu()
+        action = menu.exec(event.globalPos())
+        if action is not None:
+            self._handle_menu_action(action, actions)
+
+_overlay_window = None
+
+
+def count_overlay_windows() -> int:
+    """Testable invariant: top-level RadialVisualizerWindow instances."""
+    app = QApplication.instance()
+    if app is None:
+        return 0
+    return sum(isinstance(w, RadialVisualizerWindow)
+               for w in QApplication.topLevelWidgets())
+
+
+def get_overlay_window():
+    """Process-wide singleton: exactly one overlay window, ever.
+
+    Sleep/wake, F2, the control socket, and hide/show all reuse this
+    instance - no path may construct a second top-level window. A repeat
+    call returns the existing object (recreating only if it was deleted)
+    and logs a warning so accidental second construction is visible.
+    """
+    global _overlay_window
+    existing = _overlay_window
+    if existing is not None:
+        try:
+            from PyQt6 import sip
+            deleted = sip.isdeleted(existing)
+        except Exception:
+            deleted = False
+        if not deleted:
+            logger.warning(
+                "ui lifecycle: get_overlay_window called twice - "
+                "returning existing id=%s (no second window created)",
+                id(existing),
+            )
+            return existing
+        logger.debug("ui lifecycle: previous overlay was deleted; "
+                     "creating a fresh singleton")
+    _overlay_window = RadialVisualizerWindow()
+    return _overlay_window
+
+
+class UiBridge(QObject):
+    """Thread-safe UI controls for the socket/control thread.
+
+    Qt widgets live in the Qt/main thread and must only be touched
+    there. This bridge exposes plain methods callable from ANY thread;
+    each one emits a signal whose slot runs in the main thread via a
+    queued connection. A cached `visible` flag (written in main-thread
+    slots, read anywhere) answers status queries without touching QWidget
+    off-thread.
+    """
+
+    show_requested = pyqtSignal()
+    hide_requested = pyqtSignal()
+    toggle_requested = pyqtSignal()
+    quit_requested = pyqtSignal()
+
+    def __init__(self, window_getter):
+        super().__init__()
+        self._window_getter = window_getter
+        self.visible = True
+        self.show_requested.connect(self._do_show)
+        self.hide_requested.connect(self._do_hide)
+        self.toggle_requested.connect(self._do_toggle)
+        self.quit_requested.connect(self._do_quit)
+
+    def _window(self):
+        try:
+            return self._window_getter()
+        except Exception:
+            return None
+
+    def _do_show(self):
+        window = self._window()
+        if window is not None and window.isHidden():
+            window.show()
+        self.visible = False if window is None else not window.isHidden()
+
+    def _do_hide(self):
+        window = self._window()
+        if window is not None and not window.isHidden():
+            window.hide()
+        self.visible = False if window is None else not window.isHidden()
+
+    def _do_toggle(self):
+        window = self._window()
+        if window is None:
+            return
+        if window.isHidden():
+            window.show()
+        else:
+            window.hide()
+        self.visible = not window.isHidden()
+
+    def _do_quit(self):
+        QApplication.quit()
+
+    # Callable from any thread; slots execute in the Qt/main thread.
+    def show(self):
+        self.show_requested.emit()
+
+    def hide(self):
+        self.hide_requested.emit()
+
+    def toggle(self):
+        self.toggle_requested.emit()
+
+    def quit(self):
+        self.quit_requested.emit()
+
+
 def main():
-    app = QApplication(sys.argv)
+    # Singleton: reuse an existing QApplication (tests, embedding) instead
+    # of constructing a second one - Qt supports exactly one per process.
+    app = QApplication.instance() or QApplication(sys.argv)
     
     
 
@@ -457,7 +619,7 @@ def main():
         QMessageBox.critical(None, "Missing API Key", "API key missing! Check ~/.config/cat-talker/config.json")
         sys.exit(1)
 
-    window = RadialVisualizerWindow()
+    window = get_overlay_window()
     window.setWindowTitle("Audio Visualizer Widget")
     window.setObjectName("cat-talker-overlay")
     
@@ -466,12 +628,14 @@ def main():
     window.show()
 
 
+    # Single visibility mechanism: the UiBridge owns show/hide/toggle
+    # (always executed in the Qt/main thread). SIGUSR1 and the socket
+    # ui-* commands are just triggers into it - never competing paths.
+    ui_bridge = UiBridge(lambda: window)
+
     def handle_sigusr1(signum, frame):
-        if window.isHidden():
-            window.show()
-        else:
-            window.hide()
-            
+        ui_bridge.toggle()
+
     signal.signal(signal.SIGUSR1, handle_sigusr1)
 
     global_agent = []
@@ -521,6 +685,23 @@ def main():
 
     def on_glow(state: str):
         window.glow_signal.emit(state)
+
+    # Startup order is structural: control socket FIRST so F2 always has
+    # something to talk to, then the agent (born SLEEPING - run_loop
+    # cannot connect until a wake request arrives). No Live session,
+    # no reconnect, no mic forwarding before the first wake.
+    # Local control socket for F2 sleep/wake (Hyprland ->
+    # bin/assistant-control -> this process). No new instance is ever
+    # started when one answers; the socket file is this instance's ID.
+    def _get_agent():
+        return global_agent[0] if global_agent else None
+
+    control_thread = threading.Thread(
+        target=serve_forever,
+        kwargs={"get_agent": _get_agent, "ui": ui_bridge},
+        daemon=True,
+    )
+    control_thread.start()
 
     agent_thread = threading.Thread(
         target=start_agent_in_thread,

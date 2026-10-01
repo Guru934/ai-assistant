@@ -12,6 +12,7 @@ from google.genai import types
 
 from cat_talker.tools import ALL_TOOLS
 from cat_talker.audio import AudioInterface
+from cat_talker.sleep import SleepController, parse_voice_command
 from cat_talker.vision import VisionInterface
 from cat_talker.logging_config import get_logger
 from cat_talker.earcons import play_earcon
@@ -134,6 +135,14 @@ class GeminiDesktopAgent:
         self._pending_click = None
         self._failed_coords = set()
         self._click_failures = 0
+        # Sleep/wake: startup contract is SLEEPING (no Live session until
+        # F2 or an explicit wake). _wake_event wakes the sleep-wait;
+        # _session_tasks lets a sleep request tear down the live session.
+        self.sleep = SleepController()
+        self._wake_event = asyncio.Event()
+        self._session_tasks = []
+        self._greeted_once = False
+        self._model_spoke = False
 
     def _set_state(self, state_callback, state: str):
         if state_callback:
@@ -216,6 +225,84 @@ class GeminiDesktopAgent:
 
         threading.Thread(target=_wait, daemon=True).start()
 
+    def _cancel_session_tasks(self):
+        """Tear down the live session from any thread (F2 / idle timer).
+
+        Cancelling the supervised workers runs the existing teardown path:
+        siblings cancelled, mic flushed, SDK session closed on leaving the
+        async block. Safe when no session is active.
+        """
+        tasks = list(getattr(self, "_session_tasks", None) or [])
+        loop = getattr(self, "loop", None)
+        if loop is None or not tasks:
+            return
+
+        def _cancel():
+            for t in tasks:
+                try:
+                    if not t.done():
+                        t.cancel()
+                except Exception:
+                    pass
+
+        try:
+            loop.call_soon_threadsafe(_cancel)
+        except RuntimeError:
+            pass  # loop closed
+
+    def _set_sleep_mic_paused(self, paused: bool):
+        audio = getattr(self, "audio", None)
+        if audio is None:
+            return
+        try:
+            if paused:
+                pause = getattr(audio, "pause_input", None)
+                if pause is not None:
+                    pause()
+            else:
+                resume = getattr(audio, "resume_input", None)
+                if resume is not None:
+                    resume()
+        except Exception:
+            pass
+
+    def _signal_wake(self):
+        try:
+            self._wake_event.set()
+            return
+        except Exception:
+            pass
+        loop = getattr(self, "loop", None)
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._wake_event.set)
+            except RuntimeError:
+                pass
+
+    def request_sleep(self) -> str:
+        """Sleep now unless busy (then defer to turn end). Thread-safe."""
+        if self._is_speaking or self.sleep.is_busy():
+            self.sleep.request_sleep()  # records deferral inside
+            return "deferred"
+        disp = self.sleep.request_sleep()
+        if disp == "sleeping":
+            self._set_sleep_mic_paused(True)
+            self._cancel_session_tasks()
+        return disp
+
+    def request_wake(self) -> str:
+        """Wake (or confirm awake). Thread-safe."""
+        disp = self.sleep.request_wake()
+        self._set_sleep_mic_paused(False)
+        self._signal_wake()
+        return disp
+
+    def request_toggle(self) -> str:
+        """F2 semantic: sleeping -> wake; awake -> sleep (defer if busy)."""
+        if self.sleep.is_sleeping():
+            return self.request_wake()
+        return self.request_sleep()
+
     async def run_loop(self, volume_callback=None, app_quit_callback=None, text_callback=None,
                        state_callback=None, bubble_callback=None, glow_callback=None):
         self.loop = asyncio.get_running_loop()
@@ -229,14 +316,49 @@ class GeminiDesktopAgent:
             self.vision = VisionInterface()
 
         model = "gemini-3.8-live"
-        logger.info(f"Connecting to Gemini Live API with model: {model}")
-
 
         system_instructions = build_system_instructions()
 
+        async def idle_watchdog():
+            """Sleep after meaningful-idle timeout (never while busy)."""
+            try:
+                while not self.stop_event.is_set():
+                    await asyncio.sleep(5)
+                    if self.stop_event.is_set():
+                        break
+                    if self._is_speaking:
+                        continue
+                    if self.sleep.should_sleep():
+                        logger.info("Idle timeout: entering sleep")
+                        self.request_sleep()
+            except asyncio.CancelledError:
+                raise
+
+        watchdog = asyncio.create_task(idle_watchdog())
+
         try:
             while not self.stop_event.is_set():
+                if self.sleep.is_sleeping():
+                    # SLEEPING: no Live session, no reconnect, no mic
+                    # forwarding. Pause capture here (not only on the
+                    # request path) so a process born sleeping never
+                    # accumulates an unbounded mic queue. Wait for F2 /
+                    # explicit wake or shutdown.
+                    self._set_sleep_mic_paused(True)
+                    self._set_state(state_callback, "idle")
+                    if bubble_callback:
+                        bubble_callback("😴 Sleeping — press F2 to wake")
+                    self._wake_event.clear()
+                    while (self.sleep.is_sleeping()
+                           and not self.stop_event.is_set()):
+                        try:
+                            await asyncio.wait_for(
+                                self._wake_event.wait(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            pass
+                    continue
                 try:
+                    logger.info(f"Opening Gemini Live session (model: {model})")
                     import cat_talker.tools
                     dynamic_instructions = system_instructions
                     if cat_talker.tools.PENDING_RISKY_ACTION:
@@ -256,7 +378,9 @@ class GeminiDesktopAgent:
                     async with self.client.aio.live.connect(model=model, config=config) as session:
                         # Clear any stale mic audio queued during the previous
                         # connection, and gate the microphone onto this session.
+                        # Wake path resumes capture paused while sleeping.
                         self._clear_input_queue()
+                        self._set_sleep_mic_paused(False)
                         self._session_generation += 1
                         self._session_active.set()
                         # Fresh session: allow inspection; no frame seen yet.
@@ -271,9 +395,13 @@ class GeminiDesktopAgent:
                         logger.info("✅ Session established securely!")
                         logger.info("🎙️ Speak into your microphone now...")
                         logger.info("====================================")
-                        if text_callback:
-                            text_callback("system", "Connected! Speak now...")
-                        self._set_state(state_callback, "idle")
+                        if not self._greeted_once:
+                            self._greeted_once = True
+                            if text_callback:
+                                text_callback("system", "Connected! Speak now...")
+                        elif bubble_callback:
+                            bubble_callback("👁 Awake — listening")
+                        self._set_state(state_callback, "listening")
                         self._set_glow(glow_callback, "connected")
 
                         # Reset reconnect attempts on successful connection
@@ -384,6 +512,16 @@ class GeminiDesktopAgent:
                                                 # Turn finished: mic back on after
                                                 # pending output drains + cooldown.
                                                 self._release_mic_after_turn()
+                                                # A pending voice turn counts as
+                                                # meaningful only if the model
+                                                # engaged with it this turn.
+                                                self.sleep.confirm_voice_if_engaged(
+                                                    self._model_spoke)
+                                                self._model_spoke = False
+                                                # F2 pressed mid-response: sleep now
+                                                # that the turn is over.
+                                                if self.sleep.take_pending_sleep():
+                                                    self.request_sleep()
 
                                             # User speech transcription (requires
                                             # input_audio_transcription in the session
@@ -396,6 +534,20 @@ class GeminiDesktopAgent:
                                                     logger.info(f"🎤 User said: {input_text}")
                                                     if text_callback:
                                                         text_callback("user", input_text)
+                                                    # Voice sleep/wake phrases act immediately.
+                                                    vcmd = parse_voice_command(input_text)
+                                                    if vcmd == "sleep":
+                                                        self.request_sleep()
+                                                    elif vcmd == "wake":
+                                                        self.request_wake()
+                                                    else:
+                                                        # Raw transcription is NOT meaningful
+                                                        # activity by itself (YouTube/system
+                                                        # false positives must not reset the
+                                                        # idle timer). It only counts if the
+                                                        # model engages this turn.
+                                                        self.sleep.note_voice_heard()
+                                                        self._model_spoke = False
                                                     # New user turn: semantic dedup
                                                     # starts over (ID dedup stays
                                                     # per-session by design).
@@ -411,6 +563,9 @@ class GeminiDesktopAgent:
                                                     self._click_failures = 0
 
                                             if msg.server_content.model_turn:
+                                                # Any model output counts as engagement
+                                                # (confirms a pending voice turn).
+                                                self._model_spoke = True
                                                 # Model started responding - thinking phase
                                                 if not self._is_speaking:
                                                     self._is_speaking = True
@@ -438,11 +593,25 @@ class GeminiDesktopAgent:
                                         if hasattr(msg, "client_content") and msg.client_content:
                                             for turn in getattr(msg.client_content, "turns", []):
                                                 if turn.role == "user":
+                                                    user_text = " ".join(
+                                                        getattr(part, "text", "") or ""
+                                                        for part in turn.parts)
                                                     for part in turn.parts:
                                                         if hasattr(part, "text") and part.text and text_callback:
                                                             text_callback("user", part.text)
                                                             self._set_state(state_callback, "listening")
                                                             self._set_glow(glow_callback, "connected")
+                                                    # Typed input is deliberate: accepted
+                                                    # activity immediately (plus voice
+                                                    # sleep/wake phrases, if present).
+                                                    vcmd = parse_voice_command(user_text)
+                                                    if vcmd == "sleep":
+                                                        self.request_sleep()
+                                                    elif vcmd == "wake":
+                                                        self.request_wake()
+                                                    else:
+                                                        self.sleep.note_activity()
+                                                    self._model_spoke = False
                                                     # Text user turn: same reset
                                                     # as voice transcription.
                                                     self._interaction_id += 1
@@ -535,10 +704,18 @@ class GeminiDesktopAgent:
                                                             self._set_glow(glow_callback, "processing")
 
                                                         start_time = time.time()
-                                                        if isinstance(args, dict):
-                                                            result = func(**args)
-                                                        else:
-                                                            result = func()
+                                                        # Busy for the whole call so F2/idle
+                                                        # never sleeps mid-tool; success is
+                                                        # meaningful activity.
+                                                        self.sleep.busy_enter()
+                                                        try:
+                                                            if isinstance(args, dict):
+                                                                result = func(**args)
+                                                            else:
+                                                                result = func()
+                                                        finally:
+                                                            self.sleep.busy_exit()
+                                                        self.sleep.note_activity()
                                                         duration = time.time() - start_time
 
                                                         # Send notification if task took more than 3 seconds
@@ -781,6 +958,9 @@ class GeminiDesktopAgent:
                             asyncio.create_task(receive_worker()),
                             asyncio.create_task(synthetic_input_worker())
                         ]
+                        # Handle for sleep requests (F2/idle/voice) to tear
+                        # down this session from any thread.
+                        self._session_tasks = tasks
 
                         # Supervised teardown. Required order:
                         #   worker ends -> surface failure/cancellation ->
@@ -850,6 +1030,10 @@ class GeminiDesktopAgent:
                     self._session_active.clear()  # never leave set after disconnect
                     if self.stop_event.is_set():
                         break
+                    if self.sleep.is_sleeping():
+                        # Sleep request tore this down: no reconnect, mic
+                        # already paused; loop top enters sleep-wait.
+                        continue
 
                     self._reconnect_attempts += 1
                     max_delay = 60
@@ -862,14 +1046,23 @@ class GeminiDesktopAgent:
 
                 except asyncio.CancelledError:
                     # Cancellation is not a reconnectable failure: clear
-                    # session state and propagate so callers see it.
+                    # session state and propagate so callers see it -
+                    # UNLESS this was a sleep teardown (F2/idle/voice),
+                    # in which case the loop continues into sleep-wait.
                     self._session_active.clear()
+                    if (self.sleep.is_sleeping()
+                            and not self.stop_event.is_set()):
+                        continue
                     raise
                 except Exception as e:
                     logger.error(f"Agent connection dropped (auto-reconnecting): {e}", exc_info=True)
                     play_earcon("fail")
                     self._session_active.clear()
                     self._clear_input_queue()
+                    if self.sleep.is_sleeping():
+                        # Dropped while sleeping (or sleep won the race):
+                        # stay asleep, no reconnect.
+                        continue
 
                     self._reconnect_attempts += 1
                     max_delay = 60
@@ -882,6 +1075,10 @@ class GeminiDesktopAgent:
 
         finally:
             # Session state must never leak past shutdown/disconnect.
+            try:
+                watchdog.cancel()
+            except Exception:
+                pass
             self._session_active.clear()
             logger.info("Shutting down audio...")
             if self.audio:

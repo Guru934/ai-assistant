@@ -6,6 +6,11 @@ import pyaudio
 from ctypes import CFUNCTYPE, c_char_p, c_int, cdll
 
 from cat_talker.logging_config import get_logger
+from cat_talker.echo_suppress import (
+    EchoSuppressor,
+    discover_monitor_source,
+    BYTES_PER_CHUNK,
+)
 
 logger = get_logger("cat_talker.audio")
 
@@ -57,13 +62,197 @@ class AudioInterface:
         self.watchdog_thread = threading.Thread(target=self._audio_watchdog, daemon=True)
         self.watchdog_thread.start()
 
+        # Reference-based echo suppression (speaker/media audio leaking
+        # into the mic). The suppressor compares each mic chunk against
+        # what is currently playing on the speakers (default-sink
+        # monitor) and drops echo-dominated chunks. Fail-open: without a
+        # reference, or on any error, mic audio passes through exactly
+        # as before. Assistant-turn muting (is_playing) stays primary.
+        self._echo_enabled = True
+        try:
+            from cat_talker.config import get_echo_suppress
+            self._echo_enabled = bool(get_echo_suppress())
+        except Exception:
+            pass
+        self.echo = EchoSuppressor(enabled=self._echo_enabled)
+        self._monitor_proc = None
+        self._monitor_stop = threading.Event()
+        self._last_echo_decision = None
+        self._playback_chunks = 0
+        # DEBUG-only live sync telemetry (counts + monotonic timestamps;
+        # no audio content). Compares the mic callback clock against the
+        # reference reader clock to expose buffering offsets/drift/bursts.
+        # Created lazily via _sync_state(): the mic callback can fire
+        # before __init__ finishes, and __new__-built test instances skip
+        # __init__ entirely.
+        self._sync = self._new_sync()
+        if self._echo_enabled:
+            self.monitor_thread = threading.Thread(
+                target=self._monitor_reference_loop, daemon=True)
+            self.monitor_thread.start()
+        else:
+            logger.info("mic input: echo suppression disabled by config")
+        logger.info(f"mic input: capture open (echo suppression "
+                    f"{'on' if self._echo_enabled else 'off'})")
+
+    @staticmethod
+    def _new_sync():
+        return {
+            "mic_chunks": 0, "mic_samples": 0, "mic_first_t": None,
+            "mic_last_t": None, "mic_sizes": {},
+            "ref_reads": 0, "ref_samples": 0, "ref_first_t": None,
+            "ref_last_t": None, "ref_last_n": 0, "ref_max_gap": 0.0,
+            "ref_short_reads": 0,
+        }
+
+    def _sync_state(self):
+        s = getattr(self, "_sync", None)
+        if s is None:
+            s = self._sync = self._new_sync()
+        return s
+
+    def _monitor_reference_loop(self):
+        """Feed the echo suppressor with speaker output (sink monitor).
+
+        Runs `pw-record` on the default sink's monitor so the reference
+        contains everything hitting the speakers - assistant TTS, YouTube,
+        system sounds - regardless of source app. Self-healing with
+        backoff; if no reference is available the suppressor simply
+        passes mic audio through (fail-open).
+        """
+        import subprocess
+        import time
+        while not self._monitor_stop.is_set() and self._running:
+            monitor = discover_monitor_source()
+            if monitor is None:
+                logger.warning("mic input: no sink monitor found (pactl "
+                               "missing?) - echo suppression inactive, "
+                               "mic passes through")
+                self._monitor_stop.wait(30.0)
+                continue
+            try:
+                logger.info(f"mic input: echo reference from '{monitor}'")
+                self._monitor_proc = subprocess.Popen(
+                    ["pw-record", "--target", monitor,
+                     "--rate", "16000", "--channels", "1",
+                     "--format", "s16", "-"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                )
+                stdout = self._monitor_proc.stdout
+                if stdout is None:
+                    logger.warning("mic input: echo reference has no "
+                                   "stdout, retrying...")
+                else:
+                    import time as _t
+                    prev_t = None
+                    # Small reads (128 frames): pw-record delivers a smooth
+                    # stream, so small reads complete every ~8ms. Large
+                    # reads (e.g. 2048 frames) instead batch delivery into
+                    # 128ms lumps, swinging the true echo lag by +-1024
+                    # samples at the read cadence - far outside the
+                    # 256-tap filter span - which the estimator aliases and
+                    # the filter can never track (measured live:
+                    # suppressed=0 with reference present). Never ask for
+                    # more than the DSP can absorb per mic chunk.
+                    while not self._monitor_stop.is_set() and self._running:
+                        data = stdout.read(256)
+                        if not data:
+                            break
+                        now = _t.monotonic()
+                        n = len(data) // 2
+                        s = self._sync_state()
+                        s["ref_reads"] += 1
+                        s["ref_samples"] += n
+                        if s["ref_first_t"] is None:
+                            s["ref_first_t"] = now
+                        if prev_t is not None:
+                            s["ref_max_gap"] = max(s["ref_max_gap"],
+                                                   now - prev_t)
+                        prev_t = now
+                        s["ref_last_t"] = now
+                        s["ref_last_n"] = n
+                        if n < BYTES_PER_CHUNK:
+                            s["ref_short_reads"] += 1
+                        self.echo.feed_reference(bytes(data))
+                logger.warning("mic input: echo reference stream ended, "
+                               "retrying...")
+            except (OSError, subprocess.SubprocessError) as e:
+                logger.warning(f"mic input: cannot start echo reference "
+                               f"(pw-record missing?): {e} - mic passes through")
+            except Exception as e:
+                logger.error(f"mic input: echo reference error: {e}")
+            finally:
+                proc, self._monitor_proc = self._monitor_proc, None
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            self._monitor_stop.wait(5.0)
+
+    def pause_input(self):
+        """Sleeping: drop mic chunks at the callback (counted)."""
+        self._input_paused = True
+
+    def resume_input(self):
+        self._input_paused = False
+
     def _mic_callback(self, in_data, frame_count, time_info, status):
         if not self._running or self._loop_closed:
             return (None, pyaudio.paComplete)
+        if getattr(self, "_input_paused", False):
+            dropped = getattr(self, "_paused_dropped", 0) + 1
+            self._paused_dropped = dropped
+            return (None, pyaudio.paContinue)
         try:
             if not self.is_playing:
                 self.mic_active = True
-                self.loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, in_data)
+                out_data = in_data
+                import time as _t
+                _now = _t.monotonic()
+                _s = self._sync_state()
+                _s["mic_chunks"] += 1
+                _s["mic_samples"] += len(in_data) // 2
+                if _s["mic_first_t"] is None:
+                    _s["mic_first_t"] = _now
+                _s["mic_last_t"] = _now
+                _s["mic_sizes"][len(in_data)] = (
+                    _s["mic_sizes"].get(len(in_data), 0) + 1)
+                if self._echo_enabled and len(in_data) == BYTES_PER_CHUNK:
+                    try:
+                        out_data, decision, reason = self.echo.process(in_data)
+                        # DEBUG-only numeric diagnostics (no audio content).
+                        logger.debug(f"mic input: {self.echo.snapshot_line()}")
+                        # DEBUG-only live sync record: wall-clock
+                        # relationship between this mic chunk and the
+                        # newest reference sample.
+                        try:
+                            _in_q = self.audio_in_queue.qsize()
+                        except Exception:
+                            _in_q = -1
+                        _ref_ahead = (_s["ref_samples"] - _s["mic_samples"])
+                        _ref_stale = ((_now - _s["ref_last_t"]) * 1000.0
+                                      if _s["ref_last_t"] is not None else -1.0)
+                        logger.debug(
+                            f"live sync: mic_t={_now:.3f} "
+                            f"ref_ahead_samples={_ref_ahead} "
+                            f"ref_stale_ms={_ref_stale:.1f} "
+                            f"ref_reads={_s['ref_reads']} "
+                            f"ref_max_gap={_s['ref_max_gap']:.3f}s "
+                            f"mic_in_q={_in_q}")
+                        if decision != self._last_echo_decision:
+                            self._last_echo_decision = decision
+                            logger.debug(f"mic input: echo decision -> "
+                                         f"{decision} ({reason})")
+                        if decision != "pass":
+                            logger.debug("mic input: echo-detected chunk "
+                                         "suppressed (speaker/media audio, "
+                                         "not user speech)")
+                    except Exception as e:
+                        logger.error(f"mic input: suppressor error ({e}) - "
+                                     f"passing audio through")
+                        out_data = in_data
+                self.loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, out_data)
             else:
                 silence = b'\x00' * len(in_data)
                 self.loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, silence)
@@ -172,8 +361,15 @@ class AudioInterface:
 
     def _audio_watchdog(self):
         import time
+        ticks = 0
         while self._running:
             time.sleep(2)
+            ticks += 1
+            # Periodic echo-suppressor summary (~every 30s): distinguishes
+            # mic/user input passed vs speaker/media input suppressed.
+            if self._echo_enabled and ticks % 15 == 0:
+                logger.info(f"mic input: {self.echo.summary()} "
+                            f"(assistant playback chunks={self._playback_chunks})")
             if self._closed:
                 break
             # Check if in_stream is active
@@ -205,6 +401,10 @@ class AudioInterface:
                     logger.error(f"Failed to recreate input stream: {e}")
 
     def queue_output(self, pcm_data: bytes):
+        self._playback_chunks += 1
+        if self._playback_chunks % 200 == 1:
+            logger.debug(f"assistant playback: {self._playback_chunks} "
+                         f"chunks queued (speaker output, excluded from mic)")
         self.audio_out_queue.put(pcm_data)
 
     def clear_output_queue(self):
@@ -221,6 +421,18 @@ class AudioInterface:
         self._closed = True
         self._running = False
         self._loop_closed = True
+        try:
+            self._monitor_stop.set()
+        except AttributeError:
+            pass
+        proc = getattr(self, "_monitor_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        if getattr(self, "_echo_enabled", False):
+            logger.info(f"mic input: closing ({self.echo.summary()})")
         self.audio_out_queue.put(None)
         try:
             self.in_stream.stop_stream()
