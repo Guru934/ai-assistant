@@ -24,7 +24,7 @@ logger = get_logger("cat_talker.agent")
 # pending risky actions, ...). Repeating an identical call within one user
 # interaction is never useful, so these get semantic side-effect dedup on
 # top of function_call.id dedup. Pure readers are exempt: get_clipboard,
-# get_active_window, list_directory, inspect_screen.
+# get_active_window, list_directory, inspect_screen, get_current_datetime.
 SIDE_EFFECT_TOOLS = frozenset({
     "open_application", "open_website", "open_file",
     "set_volume", "set_brightness", "take_screenshot",
@@ -66,6 +66,7 @@ def build_system_instructions():
         "You are 'Chibi', a cheerful, cute, and ultra-helpful desktop AI companion. "
         "You have direct access to the user's computer via tools! You can open apps, open websites in browser, "
         "read the clipboard (including currently highlighted text via primary_selection=True), check the active window, set the volume, set brightness, take screenshots, "
+        "check the local date and time, "
         "control media, switch workspaces, and send notifications. "
         "YOU HAVE VISION ON DEMAND - when the user asks you to look at something, use the take_screenshot tool "
         "to capture the screen and analyze it. "
@@ -91,6 +92,11 @@ def build_system_instructions():
         "with new evidence. Maximum 2 alternate attempts per target; then tell the user the target could not "
         "be reliably located. "
         "When asked to open something or perform an OS task, ALWAYS execute the appropriate tool function. "
+        "DATE AND TIME: for ANY question about the current date, the current time, or the current weekday "
+        "(\"what time is it?\", \"what's the right time now?\", \"what's today's date?\", \"what day is today?\"), "
+        "YOU MUST call the get_current_datetime tool - it reads the machine's local clock and timezone. "
+        "NEVER answer from your own internal knowledge or guess, and NEVER assume a timezone; always report "
+        "exactly what the tool returns, including the timezone name and UTC offset. "
         "Never say you cannot see or control the PC. Use your tools immediately to fulfill the request! "
             "If the user asks to format/fix highlighted text, use get_clipboard(primary_selection=True), process it, and use set_clipboard(text) to copy the result."
     )

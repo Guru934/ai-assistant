@@ -6,6 +6,7 @@ import urllib.request
 import urllib.parse
 import re
 import json
+from datetime import datetime
 import cv2
 import mss
 import numpy as np
@@ -105,6 +106,82 @@ def get_active_window() -> str:
         return "Active window information not available."
     except Exception as e:
         return f"Error reading window info: {str(e)}"
+
+# ─── LOCAL DATE/TIME (deterministic, standard library only) ──────
+# The assistant must read date/time from the MACHINE clock, never from the
+# model's internal knowledge. No network call is made here.
+
+# UTC offset as +/-HH:MM (no colon-less or "+0000" variants).
+def _format_utc_offset(offset) -> str:
+    """Format a timedelta UTC offset as '+HH:MM' / '-HH:MM'.
+
+    Works for whole-minute offsets (including ':30'/':45' zones); seconds
+    are included only when non-zero.
+    """
+    if offset is None:
+        return "+00:00"
+    total_seconds = int(offset.total_seconds())
+    sign = "+" if total_seconds >= 0 else "-"
+    total_seconds = abs(total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    text = f"{sign}{hours:02d}:{minutes:02d}"
+    if seconds:
+        text += f":{seconds:02d}"
+    return text
+
+
+def _timezone_name(dt: datetime, offset) -> str:
+    """Best-effort IANA timezone name from the environment.
+
+    Standard library only: ``datetime.now().astimezone().tzinfo`` is a fixed
+    offset (no name), so the name comes from the ``TZ`` environment variable
+    when set, otherwise "local" is reported and the UTC offset still carries
+    the real information. Nothing is hardcoded to any region.
+    """
+    name = getattr(dt.tzinfo, "key", None)
+    if not name:
+        name = os.environ.get("TZ", "").strip() or None
+    return name or "local"
+
+
+def _local_now() -> datetime:
+    """Timezone-aware 'now' in the machine's configured local timezone."""
+    return datetime.now().astimezone()
+
+
+def _format_datetime(dt: datetime) -> str:
+    """Render a timezone-aware datetime for the assistant and the user.
+
+    Pure helper (no reliance on the real clock) so formatting can be tested
+    deterministically against a fixed datetime.
+    """
+    if dt.tzinfo is None:
+        return ("Error: datetimes must be timezone-aware to be reported "
+                "reliably.")
+    offset = dt.utcoffset()
+    return (
+        f"Full date: {dt.strftime('%A, %d %B %Y')}\n"
+        f"Weekday: {dt.strftime('%A')}\n"
+        f"Local time: {dt.strftime('%I:%M %p')} ({dt.strftime('%H:%M:%S')})\n"
+        f"Timezone: {_timezone_name(dt, offset)}\n"
+        f"UTC offset: {_format_utc_offset(offset)}\n"
+    )
+
+
+def get_current_datetime() -> str:
+    """Returns the current local date, weekday, time, timezone and UTC offset.
+
+    Use this for ANY question about today's date, the current time, or the
+    current weekday ('what time is it?', 'what's today's date?', 'what day is
+    today?'). Never answer these from your own knowledge - always call this
+    tool, which reads the machine's system clock.
+    """
+    try:
+        return _format_datetime(_local_now())
+    except Exception as e:
+        return f"Error reading local date/time: {e}"
+
 
 def list_directory(path: str) -> str:
     target_path = os.path.expanduser(path)
@@ -556,7 +633,7 @@ ALL_TOOLS = [
     open_file, set_volume, set_brightness, take_screenshot, search_and_play_youtube,
     focus_or_launch, switch_workspace, media_action, set_clipboard, send_notification,
     confirm_action, cancel_action, click_screen, type_text, press_key,
-    inspect_screen, save_user_preference
+    inspect_screen, save_user_preference, get_current_datetime
 ]
 
 

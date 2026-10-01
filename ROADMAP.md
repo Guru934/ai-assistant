@@ -7,7 +7,8 @@ Completed
 ├── Sleep/wake system
 ├── Global F2 control
 ├── UI control
-└── Graceful shutdown
+├── Graceful shutdown
+└── Time/date
 
 Current
 └── Audio isolation / echo cancellation
@@ -15,8 +16,6 @@ Current
 
 Next
 ├── Current information
-├── Time/date
-├── Web/current information
 ├── Weather
 ├── Memory/preferences
 ├── TTS

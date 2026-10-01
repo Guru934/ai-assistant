@@ -16,6 +16,11 @@ sleep/wake, and quit.
   brightness, workspaces, media (`playerctl`), notifications, YouTube
   search-and-play, and user preferences. Risky actions (`click_screen`,
   `type_text`, `press_key`) require spoken "yes" approval first.
+- **Local date/time** — `get_current_datetime` answers "what time is it?",
+  "what's today's date?", "what day is today?" from Python's system clock
+  (deterministic, timezone-aware, standard library only, no network):
+  full calendar date, weekday, local time, local timezone name and UTC
+  offset in the machine's configured timezone (never a hardcoded one).
 - **Sleep/wake with 60 s meaningful-idle timeout** — starts SLEEPING (no
   Live session, no mic forwarding). Waking opens one fresh session;
   sleeping closes it cleanly with no reconnect loop. Only accepted
@@ -64,15 +69,19 @@ exits with an error dialog instead of starting broken.
 ## How to run it
 
 Terminal (from the repo root):
+
 ```bash
 cd /home/guru/ai-assistant
 PYTHONPATH=src .venv/bin/python -m cat_talker.main
 ```
+
 Normal daily control is via the launcher (works from any directory):
+
 ```bash
 /home/guru/ai-assistant/bin/assistant-control toggle   # wake or sleep
 /home/guru/ai-assistant/bin/assistant-control status
 ```
+
 The app starts SLEEPING (visible, silent, no Gemini connection) and waits
 for F2. `assistant-control stop` quits it gracefully.
 
@@ -96,7 +105,8 @@ create_bind("F4", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ## Current working capabilities
 
 Voice dialogue, on-demand vision, OS/media/YouTube tools with spoken
-approval for risky ones, sleep/wake + F1/F2/F4 control plane,
+approval for risky ones, deterministic local date/time, sleep/wake +
+F1/F2/F4 control plane,
 single-instance launch, single-window invariant, 60 s idle sleep,
 conversation history log, JSON config in `~/.config/cat-talker/`.
 
@@ -118,7 +128,8 @@ conversation history log, JSON config in `~/.config/cat-talker/`.
 ```bash
 PYTHONPATH=src .venv/bin/python -m pytest -q
 ```
-135 tests, no hardware or network needed (fakes for Live sessions,
+
+154 tests, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen). Current suite covers session lifecycle,
 computer-use grounding, echo DSP, audio feedback, sleep/wake + F1/F2/F4
-control, window lifecycle, shutdown, and packaging.
+control, window lifecycle, shutdown, packaging, and local date/time.

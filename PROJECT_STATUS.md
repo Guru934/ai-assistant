@@ -1,8 +1,9 @@
 # AI Assistant — current verified project state
 
-Checkpoint: all green, uncommitted working tree (see `git status`).
+Checkpoint: all green, committed working tree at `067df3f` (plus the
+local date/time feature described below; see `git status`).
 
-- Tests: **135 passed** (`PYTHONPATH=src .venv/bin/python -m pytest -q`),
+- Tests: **154 passed** (`PYTHONPATH=src .venv/bin/python -m pytest -q`),
   no hardware or network required.
 - Sleep/wake implemented: startup SLEEPING, F2 toggle with busy
   deferral, 60 s meaningful-idle timeout, greeting-once, no reconnect
@@ -20,8 +21,16 @@ Checkpoint: all green, uncommitted working tree (see `git status`).
   `audio.py`, `vision.py` (grim/mss + Hyprland coordinates), `tools.py`
   (OS/media/vision actions + voice approval), `sleep.py`, `control.py`.
 - Major completed capabilities: voice dialogue, on-demand vision,
-  OS tools, sleep/wake + F1/F2/F4 control plane, graceful shutdown,
+  OS tools, deterministic local date/time (`get_current_datetime`,
+  timezone-aware, machine clock + configured local timezone, no network),
+  sleep/wake + F1/F2/F4 control plane, graceful shutdown,
   conversation history log, JSON config.
+- Local date/time: `get_current_datetime` is a pure read-only tool in
+  `ALL_TOOLS` and is deliberately NOT in `SIDE_EFFECT_TOOLS` (exempt from
+  side-effect dedup). It reports full calendar date, weekday, local time,
+  timezone name and UTC offset from Python's system clock; the system
+  prompt directs "what time is it?" / "what's today's date?" / "what day
+  is today?" to the tool instead of model knowledge.
 - Known limitations:
   - **Generic visual clicking is best-effort.** Grounding can miss;
     bounded by max-2-alternate retry, then the assistant asks the user.
