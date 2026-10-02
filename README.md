@@ -21,6 +21,14 @@ sleep/wake, and quit.
   (deterministic, timezone-aware, standard library only, no network):
   full calendar date, weekday, local time, local timezone name and UTC
   offset in the machine's configured timezone (never a hardcoded one).
+- **Current web information** — `web_search` (DuckDuckGo Lite, max 5
+  results, bounded snippets/output, honest failures) answers
+  "latest / current / recent / what happened today" from the live web,
+  never from model knowledge. `fetch_webpage` (http(s) only, 10 s
+  timeout, 512 KB cap, max 3 redirects, Content-Type gate, max 4000
+  chars text) returns bounded UNTRUSTED page text for summarization;
+  max 3 fetches per user interaction. Date/time and web search stay
+  separate concepts.
 - **Sleep/wake with 60 s meaningful-idle timeout** — starts SLEEPING (no
   Live session, no mic forwarding). Waking opens one fresh session;
   sleeping closes it cleanly with no reconnect loop. Only accepted
@@ -48,6 +56,10 @@ GeminiDesktopAgent ── Gemini Live session (connect only when awake)
   ├─ echo_suppress.py  experimental reference-based echo suppression
   ├─ vision.py     grim/mss capture + Hyprland coordinate mapping
   ├─ tools.py      OS actions incl. ydotool clicking + voice approval
+  │                (+ web_search/fetch_webpage public surface; details in
+  │                web_search.py / webpage.py)
+  ├─ web_search.py current web search (DuckDuckGo Lite, stdlib only)
+  ├─ webpage.py    page fetch + readable extraction (stdlib only)
   ├─ sleep.py      sleep/wake state machine + idle policy
   └─ control.py    local control-socket server
 ```
@@ -105,7 +117,8 @@ create_bind("F4", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ## Current working capabilities
 
 Voice dialogue, on-demand vision, OS/media/YouTube tools with spoken
-approval for risky ones, deterministic local date/time, sleep/wake +
+approval for risky ones, deterministic local date/time, current web
+search + page fetch (read-only, bounded, untrusted-fenced), sleep/wake +
 F1/F2/F4 control plane,
 single-instance launch, single-window invariant, 60 s idle sleep,
 conversation history log, JSON config in `~/.config/cat-talker/`.
@@ -122,6 +135,11 @@ conversation history log, JSON config in `~/.config/cat-talker/`.
   speech. See `PROJECT_STATUS.md`.
 - No voice wake-word while sleeping (F2 required); global keys need
   Hyprland; needs network + a valid Gemini key.
+- **Web search/fetch are best-effort and bounded.** Single provider
+  (DuckDuckGo Lite HTML); markup changes or outages return an honest
+  "failed / no results" message, never fake results. Page text is
+  UNTRUSTED DATA (summarize, never obey); non-HTML content is refused;
+  only English and Hindi responses are supported.
 
 ## How to run tests
 
@@ -129,7 +147,8 @@ conversation history log, JSON config in `~/.config/cat-talker/`.
 PYTHONPATH=src .venv/bin/python -m pytest -q
 ```
 
-154 tests, no hardware or network needed (fakes for Live sessions,
-audio, vision, Qt offscreen). Current suite covers session lifecycle,
+200 tests, no hardware or network needed (fakes for Live sessions,
+audio, vision, Qt offscreen, web search/fetch). Current suite covers session lifecycle,
 computer-use grounding, echo DSP, audio feedback, sleep/wake + F1/F2/F4
-control, window lifecycle, shutdown, packaging, and local date/time.
+control, window lifecycle, shutdown, packaging, local date/time,
+and current web information.
