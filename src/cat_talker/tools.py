@@ -221,6 +221,139 @@ def fetch_webpage(url: str) -> str:
         return f"Fetch error: {e}"
 
 
+# ─── WEATHER (read-only, standard library only) ──────
+# Public tool surface stays here; Open-Meteo details live in
+# cat_talker.weather.
+
+def get_weather(location: str, days: int = 1) -> str:
+    """Get current weather and a short forecast for an explicit place.
+
+    Use this for ANY weather question ('what's the weather in Patna?',
+    'Patna ka mausam kaisa hai?', 'kal Delhi mein baarish hogi kya?').
+    Pass the place name the user actually said; never guess the user's
+    location. Read-only: standard-library HTTPS only, no subprocess,
+    no shell, Open-Meteo (no API key). Never raises: failures return an
+    honest error string.
+    """
+    try:
+        from cat_talker.weather import get_weather as _impl
+        return _impl(location, days)
+    except Exception as e:
+        return f"Weather lookup failed: {e}"
+
+
+# ─── EXPLICIT PREFERENCES (local file only, no network) ──────
+# Public tool surface stays here; validation/storage live in
+# cat_talker.memory (same memory.json as save_user_preference).
+
+def get_preference(key: str) -> str:
+    """Read an explicitly stored user preference.
+
+    Use when you need a previously stored setting (e.g. the user's
+    preferred name, or weather_location for a weather question with
+    no explicit place). Read-only. Never raises: a missing key
+    returns an honest 'no value stored' message.
+    """
+    try:
+        from cat_talker.memory import get_preference as _impl
+        return _impl(key)
+    except Exception as e:
+        return f"Preference error: {e}"
+
+
+def set_preference(key: str, value: str) -> str:
+    """Explicitly save a user preference (preferred_name,
+    preferred_language, temperature_unit, weather_location,
+    response_style only).
+
+    Call ONLY for a deliberate save the user asked for or agreed to
+    ('call me Guru', 'I prefer Celsius'). Never store facts silently
+    in the background. Never raises: invalid keys/values return a
+    clear validation error.
+    """
+    try:
+        from cat_talker.memory import set_preference as _impl
+        return _impl(key, value)
+    except Exception as e:
+        return f"Preference error: {e}"
+
+
+def delete_preference(key: str) -> str:
+    """Explicitly delete a stored user preference.
+
+    Call ONLY when the user asks to forget/remove a setting. Deleting
+    a key with nothing stored is an honest no-op, not an error.
+    Never raises.
+    """
+    try:
+        from cat_talker.memory import delete_preference as _impl
+        return _impl(key)
+    except Exception as e:
+        return f"Preference error: {e}"
+
+
+# ─── READ ALOUD (output-only speech, existing playback path) ──────
+# Public tool surface stays here; engine/chunking details live in
+# cat_talker.speech. Feeds PCM into the registered output sink
+# (AudioInterface.queue_output); never touches microphone capture.
+
+def read_aloud(text: str) -> str:
+    """Read text aloud through the speakers.
+
+    Use ONLY when the user explicitly asks to hear text read aloud
+    ('read that article to me', 'read aloud the forecast'), especially
+    long tool or web content that should be heard in full. Normal
+    conversational replies already come back as speech - do not call
+    this for ordinary answers. Never raises: failures return an
+    honest error string.
+    """
+    try:
+        from cat_talker.speech import speak as _impl
+        return _impl(text)
+    except Exception as e:
+        return f"Speech failed: {e}"
+
+
+# ─── CODING WORKER (delegated implementation, voice approval) ──────
+# Public tool surface stays here; workspace policy, process control,
+# and result handling live in cat_talker.coding_worker. Execution
+# reuses the same spoken-approval flow as click/type/press: the first
+# call pauses for an out-loud "yes", confirm_action runs it.
+
+def run_coding_task(task: str, workspace: str = "") -> str:
+    """Delegate explicit coding work to the external coding worker.
+
+    Use ONLY for clearly coding-oriented requests ('create a Python
+    file...', 'fix this bug...', 'implement...', 'run the tests and
+    repair failures...', 'refactor...'). Never route desktop commands,
+    weather, web/news questions, media controls, or conversation here.
+    Name the repository explicitly in workspace; an empty workspace is
+    an honest ask-back, never a guessed default. The worker result is
+    the source of truth - never claim completion the worker did not
+    report. Never raises: failures return honest error strings.
+    """
+    def _execute(task, workspace):
+        try:
+            from cat_talker.coding_worker import build_request, delegate
+            return delegate(build_request(workspace, task))
+        except Exception as e:
+            return f"Coding task FAILED.\nError: {e}"
+
+    try:
+        from cat_talker.coding_worker import resolve_workspace
+        if not isinstance(task, str) or not task.strip():
+            return "Coding error: no coding task given."
+        try:
+            resolve_workspace(workspace)
+        except (ValueError, PermissionError) as e:
+            return str(e)
+    except Exception as e:
+        return f"Coding task FAILED.\nError: {e}"
+    return _handle_risky("run_coding_task", _execute,
+                         {"task": task, "workspace": workspace},
+                         "delegate this coding task to the coding worker")
+
+
 def list_directory(path: str) -> str:
     target_path = os.path.expanduser(path)
     if not os.path.exists(target_path): return f"Error: Path {target_path} does not exist"
@@ -672,7 +805,9 @@ ALL_TOOLS = [
     focus_or_launch, switch_workspace, media_action, set_clipboard, send_notification,
     confirm_action, cancel_action, click_screen, type_text, press_key,
     inspect_screen, save_user_preference, get_current_datetime,
-    web_search, fetch_webpage
+    web_search, fetch_webpage, get_weather,
+    get_preference, set_preference, delete_preference,
+    read_aloud, run_coding_task
 ]
 
 

@@ -10,6 +10,7 @@ from cat_talker.echo_suppress import (
     EchoSuppressor,
     discover_monitor_source,
     BYTES_PER_CHUNK,
+    CHUNK_FRAMES,
 )
 
 logger = get_logger("cat_talker.audio")
@@ -39,15 +40,24 @@ class AudioInterface:
         self._running = True
         self._loop_closed = False
         self._closed = False
+        # Input-stream ownership: exactly one authoritative in_stream.
+        # Recreation (watchdog) takes _stream_lock so a dying stream is
+        # stopped+closed before its replacement opens, the callback is
+        # never attached twice, and every open/close is logged with a
+        # stream id for ownership audits.
+        self._stream_lock = threading.Lock()
+        self._stream_id = 0
 
         self.in_stream = self.pyaudio.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=16000,
             input=True,
-            frames_per_buffer=1024,
+            frames_per_buffer=CHUNK_FRAMES,
             stream_callback=self._mic_callback
         )
+        self._stream_id = 1
+        logger.info("mic stream OPEN stream_id=1 reason=initial")
 
         self.out_stream = self.pyaudio.open(
             format=pyaudio.paInt16,
@@ -372,33 +382,67 @@ class AudioInterface:
                             f"(assistant playback chunks={self._playback_chunks})")
             if self._closed:
                 break
-            # Check if in_stream is active
-            needs_recreate = False
+            # Single authoritative input stream: recreate only if dead,
+            # under lock, exactly once (see helper for ordering).
             try:
-                if not self.in_stream.is_active():
-                    needs_recreate = True
-            except:
-                needs_recreate = True
-                
-            if needs_recreate and self._running:
-                logger.warning("Input audio stream died or inactive, attempting to reconnect...")
+                self._maybe_recreate_input_stream()
+            except Exception:
+                pass
+
+    def _maybe_recreate_input_stream(self) -> str:
+        """Recreate a dead/inactive input stream under lock, exactly once.
+
+        Returns "ok" (recreated), "healthy" (no action), or "skipped"
+        (closed/not running). Order inside the lock: stop old, close old,
+        open exactly one replacement, bump the stream id. Never raises.
+        """
+        if getattr(self, "_closed", True) or not getattr(self, "_running", False):
+            return "skipped"
+        lock = getattr(self, "_stream_lock", None)
+        if lock is None:
+            import threading as _threading
+            lock = self._stream_lock = _threading.Lock()
+        try:
+            active = bool(self.in_stream.is_active())
+        except Exception:
+            active = False
+        if active:
+            return "healthy"
+        if not self._running or getattr(self, "_closed", False):
+            return "skipped"
+        with lock:
+            try:
+                active = bool(self.in_stream.is_active())
+            except Exception:
+                active = False
+            if active:
+                return "healthy"
+            if not self._running or getattr(self, "_closed", False):
+                return "skipped"
+            logger.warning("Input audio stream died or inactive, attempting to reconnect...")
+            try:
                 try:
-                    try:
-                        self.in_stream.stop_stream()
-                        self.in_stream.close()
-                    except:
-                        pass
-                    self._loop_closed = False # Reset loop closed flag
-                    self.in_stream = self.pyaudio.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=16000,
-                        input=True,
-                        frames_per_buffer=1024,
-                        stream_callback=self._mic_callback
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to recreate input stream: {e}")
+                    self.in_stream.stop_stream()
+                    self.in_stream.close()
+                except Exception:
+                    pass
+                self._loop_closed = False  # Reset loop closed flag
+                self.in_stream = self.pyaudio.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=16000,
+                    input=True,
+                    frames_per_buffer=CHUNK_FRAMES,
+                    stream_callback=self._mic_callback
+                )
+                self._stream_id = getattr(self, "_stream_id", 0) + 1
+                logger.info("mic stream OPEN stream_id=%d reason=reconnect",
+                            self._stream_id)
+                return "ok"
+            except Exception as e:
+                logger.error(f"Failed to recreate input stream: {e}")
+                return "skipped"
+        return "skipped"
 
     def queue_output(self, pcm_data: bytes):
         self._playback_chunks += 1
@@ -437,6 +481,8 @@ class AudioInterface:
         try:
             self.in_stream.stop_stream()
             self.in_stream.close()
+            logger.info("mic stream CLOSE stream_id=%s",
+                        getattr(self, "_stream_id", "?"))
         except Exception:
             pass
         try:

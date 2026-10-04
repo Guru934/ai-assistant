@@ -31,7 +31,11 @@ import collections
 import numpy as np
 
 RATE = 16000
-CHUNK_FRAMES = 1024
+# Single shared source of truth for the microphone chunk size (also used
+# by AudioInterface input frames, BYTES_PER_CHUNK, paced reference
+# consumption, and mic buffering below): 512 frames = 32 ms at 16 kHz,
+# inside Google's 20-40 ms Live streaming guidance.
+CHUNK_FRAMES = 512
 BYTES_PER_CHUNK = CHUNK_FRAMES * 2  # int16 mono
 
 # Reference history: 1s, enough for delay search + filter context.
@@ -49,7 +53,7 @@ PACE_FRAMES = CHUNK_FRAMES
 # Mic decision delay (chunks): the reference path delivers audio later
 # than the mic callback needs it. Holding mic chunks back this many
 # callbacks lets the reference arrive, shifting the mean lag solidly into
-# estimator range. Cost: 64ms of mic-path latency (chunks still stream
+# estimator range. Cost: 32ms of mic-path latency (chunks still stream
 # continuously).
 MIC_DELAY_CHUNKS = 1
 # Staging trim: while the reader outruns consumption (startup skew where
@@ -158,12 +162,18 @@ class EchoSuppressor:
 
         Only stages: transfer into the history happens in process(), one
         mic-chunk worth per call, so history and mic advance in lockstep
-        regardless of reader quantum.
+        regardless of reader quantum. Staging is hard-capped with the
+        same TRIM constants process() uses, so a long stretch with no
+        consumption (e.g. the whole sleep period) cannot grow the queue
+        without bound; the oldest samples are simply stale skew.
         """
         if not pcm:
             return
         arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float64) / 32768.0
         self._pending.extend(arr.tolist())
+        over = len(self._pending) - (TRIM_AT + PACE_FRAMES)
+        for _ in range(max(0, over)):
+            self._pending.popleft()
 
     def _transfer_paced(self):
         """Move one chunk-worth from staging to history; trim stale skew.

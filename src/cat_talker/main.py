@@ -696,12 +696,31 @@ def main():
     def _get_agent():
         return global_agent[0] if global_agent else None
 
+    # Single-instance gate: if another live assistant owns the control
+    # socket, this process must NOT continue headless (a second live
+    # microphone pipeline fighting over one mic device fragments
+    # transcription). Exit before the agent thread starts instead.
+    control_socket_ready = threading.Event()
+    control_socket_ok = []
     control_thread = threading.Thread(
         target=serve_forever,
-        kwargs={"get_agent": _get_agent, "ui": ui_bridge},
+        kwargs={"get_agent": _get_agent, "ui": ui_bridge,
+                "on_ready": lambda ok: (control_socket_ok.append(ok),
+                                        control_socket_ready.set())},
         daemon=True,
     )
     control_thread.start()
+
+    # Single-instance gate: if another live assistant owns the control
+    # socket, this process must NOT continue headless (a second live
+    # microphone pipeline fighting over one mic device fragments
+    # transcription). Exit before the agent thread starts instead.
+    control_socket_ready.wait(timeout=10.0)
+    if not control_socket_ok or control_socket_ok[0] is not True:
+        logger.error(
+            "control socket owned by another live instance; "
+            "refusing to start a second assistant")
+        raise SystemExit(2)
 
     agent_thread = threading.Thread(
         target=start_agent_in_thread,

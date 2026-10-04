@@ -137,3 +137,81 @@ def test_sleep_during_speech_is_not_deferred():
     assert disp == "sleeping", \
         "sleep during speech must tear down now, got %r" % disp
     assert agent.sleep.is_sleeping()
+
+
+# 7. sleep while speaking clears speech/suppression/output state (unit).
+def test_sleep_while_speaking_clears_audio_state():
+    import cat_talker.tools as tools_mod
+
+    agent = make_agent()
+    audio = agent.audio
+    # Simulate mid-speech: output suppression engaged, TTS queued.
+    agent._is_speaking = True
+    audio.suppress_mic()
+    audio.audio_out_queue.put_nowait(b"tts-pending")
+    drained = []
+    orig_clear = audio.clear_output_queue
+    orig_stop_duck = tools_mod.stop_media_ducking
+
+    def draining_clear():
+        while not audio.audio_out_queue.empty():
+            drained.append(audio.audio_out_queue.get_nowait())
+
+    audio.clear_output_queue = draining_clear
+    calls = []
+    tools_mod.stop_media_ducking = lambda: calls.append(1)
+    try:
+        assert agent.request_sleep() == "sleeping"
+    finally:
+        audio.clear_output_queue = orig_clear
+        tools_mod.stop_media_ducking = orig_stop_duck
+    assert agent._is_speaking is False, "speech flag leaked past sleep"
+    assert audio.is_playing is False, "mic suppression leaked past sleep"
+    assert drained == [b"tts-pending"], "queued output not cleared on sleep"
+    assert audio.input_paused is True, "mic input not paused on sleep"
+    assert calls == [1], "media ducking not stopped on sleep"
+
+
+# 8. wake defers mic resume until a fresh session connects (unit).
+def test_wake_does_not_resume_mic_before_connect():
+    agent = make_agent()
+    audio = agent.audio
+    assert agent.request_sleep() == "sleeping"
+    assert audio.input_paused is True
+    assert agent.request_wake() == "awake"
+    assert audio.input_paused is True, \
+        "wake resumed capture before any session connected"
+
+
+# 9. end to end: sleep -> wake -> mic forwards in the fresh session.
+def test_sleep_wake_cycle_mic_forwards_after_wake():
+    agent = make_agent()
+    first = FakeSession(interactions=_sleep_while_speaking_session())
+    second = FakeSession(hang=True)
+    count = wire_connect(agent, [first, second])
+    audio = agent.audio
+
+    async def go():
+        import asyncio as _aio
+        loop = _aio.get_running_loop()
+        loop.call_later(0.5, agent.request_wake)
+        loop.call_later(0.75,
+                        lambda: audio.audio_in_queue.put_nowait(b"live-after-wake"))
+        loop.call_later(1.1, agent.stop_event.set)
+        await _aio.wait_for(agent.run_loop(), timeout=11.1)
+
+    import asyncio as _aio
+    real_sleep = _aio.sleep
+
+    async def fast_sleep(delay, *a, **k):
+        await real_sleep(min(delay, 0.02), *a, **k)
+
+    with patch.object(_aio, "sleep", fast_sleep):
+        _aio.run(go())
+    assert first.exited, "sleep must have closed the first session"
+    assert count[0] == 2, "wake must open exactly one fresh session"
+    assert audio.input_paused is False, "connect must resume mic capture"
+    assert audio.is_playing is False, "suppression state leaked into new session"
+    assert second.sent_audio == [b"live-after-wake"], \
+        "mic stuck after wake: chunk never reached the fresh session: %r" % (
+            second.sent_audio,)

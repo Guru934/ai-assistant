@@ -166,7 +166,7 @@ def test_live_read_quantum_with_startup_skew_suppresses():
     """Regression for the live suppressed=0 failure with reference present.
 
     Live, the monitor reader delivers 2048-frame quanta while mic chunks
-    are 1024 frames, and the monitor starts ~2s before the first mic
+    are 512 frames, and the monitor starts ~2s before the first mic
     callback. Pre-fix the estimator faced a +-1024-sample sawtooth with
     the needed sample ~500 samples in the future: correlation flickered,
     the filter never converged, suppression stayed zero despite a loud,
@@ -201,11 +201,13 @@ def test_live_read_quantum_with_startup_skew_suppresses():
     decided = {}
     delays = []
     for i, mc in enumerate(mcs):
-        # Lumpy delivery: a 2048-frame burst every 2nd chunk, as the old
-        # 4096-byte reader produced (smooth readers are a subset: bursts
-        # of one quantum each chunk). Average rate still matches the mic.
-        if i % 2 == 0:
-            feed_upto(skew + (i + 2) * CHUNK_FRAMES + 64)
+        # Lumpy delivery: a 2048-frame burst every 4th chunk (same
+        # per-chunk average and burst ratio as the old 4096-byte reader
+        # produced at 1024-frame mic chunks; smooth readers are a subset:
+        # bursts of one quantum each chunk). Average rate still matches
+        # the mic.
+        if i % 4 == 0:
+            feed_upto(skew + (i + 4) * CHUNK_FRAMES + 64)
         out, d, r = sup.process(mc)
         delays.append(sup._delay)
         if i >= MIC_DELAY_CHUNKS:
@@ -227,9 +229,11 @@ def test_quiet_reference_passes_through():
     sup = EchoSuppressor()
     quiet = np.zeros(CHUNK_FRAMES, dtype=np.int16).tobytes()
     mic = _music_like(CHUNK_FRAMES, seed=7).tobytes()
-    # 10 identical rounds: history fills past reference_ready while the
-    # decided chunk (always the same bytes here) sees quiet reference.
-    out, decision, reason = _drive_decision(sup, quiet, mic, calls=10)
+    # 20 identical rounds: history fills past reference_ready (half a
+    # second of reference = 8000 samples takes 16 chunks at 512 frames)
+    # while the decided chunk (always the same bytes here) sees quiet
+    # reference.
+    out, decision, reason = _drive_decision(sup, quiet, mic, calls=20)
     assert decision == "pass"
     assert out == mic
     assert "reference-quiet" in reason

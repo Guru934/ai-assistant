@@ -88,20 +88,82 @@ def _handle_command(get_agent, cmd: str, ui=None) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+def _adopt_inherited_lock():
+    """Adopt the spawn lock inherited from bin/assistant-control.
+
+    The launcher holds the runtime-dir lock while spawning and passes
+    its fd down (same open file description). Re-locking it here is a
+    no-op success for us but would block rivals, which is exactly the
+    ownership we need - and the fd stays open for the server's lifetime
+    because this function runs until shutdown. Returns the fd, or None
+    when there is nothing usable to adopt (manual launches fall back
+    to opening the lock file themselves).
+    """
+    import fcntl
+    raw = os.environ.get("CAT_TALKER_LOCK_FD", "").strip()
+    if not raw:
+        return None
+    try:
+        fd = int(raw)
+    except ValueError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError, ValueError):
+        # Held by someone else, or not a real inherited fd: do not use.
+        return None
+    return fd
+
+
 def serve_forever(get_agent, path: str | None = None,
                   stop_event: threading.Event | None = None,
-                  ui=None):
+                  ui=None, on_ready=None):
     """Bind the control socket and serve until stop_event is set.
 
     A stale socket file from a dead instance is removed first; an
     EADDRINUSE from a LIVE instance propagates so a second server can
     never steal this instance's identity.
+
+    on_ready, if given, is called with True once listening, or False
+    if another live instance owns this runtime dir. Ownership is an
+    exclusive lock held for the server's whole lifetime: without it a
+    second server merely unlinks the live socket file and binds its own,
+    leaving two live microphone pipelines (the duplicate-listener
+    failure) with F2/F3 reaching only one of them. A child spawned by
+    bin/assistant-control inherits the already-held lock fd via
+    CAT_TALKER_LOCK_FD and adopts it (same open file description, so no
+    self-conflict); otherwise the lock file is opened and locked here.
     """
     path = path or socket_path()
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     except OSError:
         pass
+    import fcntl
+    lock_fd = _adopt_inherited_lock()
+    if lock_fd is None:
+        try:
+            lock_fd = os.open(os.path.join(os.path.dirname(path) or ".",
+                                           "launch.lock"),
+                              os.O_CREAT | os.O_RDWR, 0o644)
+        except OSError:
+            lock_fd = None
+    if lock_fd is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            # Another live instance holds this runtime dir - never unlink
+            # its socket, never steal it, never run headless beside it.
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            if on_ready is not None:
+                try:
+                    on_ready(False)
+                except Exception:
+                    pass
+            raise OSError("assistant already running in this runtime dir")
     try:
         os.unlink(path)
     except FileNotFoundError:
@@ -114,10 +176,20 @@ def serve_forever(get_agent, path: str | None = None,
     except OSError:
         # A live instance owns this path - never steal it.
         srv.close()
+        if on_ready is not None:
+            try:
+                on_ready(False)
+            except Exception:
+                pass
         raise
     srv.listen(8)
     srv.settimeout(0.5)
     logger.info(f"control socket listening on {path}")
+    if on_ready is not None:
+        try:
+            on_ready(True)
+        except Exception:
+            pass
     try:
         while stop_event is None or not stop_event.is_set():
             try:
@@ -150,6 +222,11 @@ def serve_forever(get_agent, path: str | None = None,
             os.unlink(path)
         except OSError:
             pass
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)  # releases the runtime-dir ownership lock
+            except OSError:
+                pass
 
 
 def send_command(cmd: str, path: str | None = None, timeout: float = 3.0) -> dict:

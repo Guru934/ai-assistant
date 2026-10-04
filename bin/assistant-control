@@ -25,8 +25,11 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from cat_talker.control import lock_path, send_command, socket_path
 
-SPAWN_WAIT_S = 15.0
-LOCK_TIMEOUT_S = 10.0
+SPAWN_WAIT_S = float(os.environ.get("CAT_TALKER_SPAWN_WAIT_S", "15.0"))
+LOCK_TIMEOUT_S = float(os.environ.get("CAT_TALKER_LOCK_TIMEOUT_S", "10.0"))
+
+# How much of a dead child's spawn log to report on startup failure.
+LOG_TAIL_BYTES = 8192
 
 
 def _runtime_dir():
@@ -50,16 +53,22 @@ def _try_forward(cmd, path):
         return None
 
 
-def _wait_for_socket(path, deadline):
-    while time.monotonic() < deadline:
-        reply = _try_forward("status", path)
-        if reply is not None and reply.get("ok"):
-            return True
-        time.sleep(0.2)
-    return False
+def _spawn_log_path():
+    return os.path.join(
+        _runtime_dir()
+        or os.environ.get("XDG_RUNTIME_DIR")
+        or os.path.join(os.path.expanduser("~"), ".cache", "cat-talker"),
+        "assistant-control-spawn.log",
+    )
 
 
-def _launch_once(path):
+def _spawn_child(path, lock_fd):
+    """Spawn one child process. Call with the spawn lock held; the held
+    lock file descriptor is inherited by the child (same open file
+    description), so the child already owns runtimedir ownership when
+    it starts serving - and rival launchers stay blocked on the lock
+    until this launcher is done waiting (see _await_child_socket)."""
+    argv = _spawn_argv()
     argv = _spawn_argv()
     # Fully absolute child environment: works from any caller CWD
     # (Hyprland has none). Same command as a terminal launch:
@@ -70,24 +79,69 @@ def _launch_once(path):
         os.pathsep + child_env["PYTHONPATH"]
         if child_env.get("PYTHONPATH") else ""
     )
-    log = os.path.join(
-        _runtime_dir()
-        or os.environ.get("XDG_RUNTIME_DIR")
-        or os.path.join(os.path.expanduser("~"), ".cache", "cat-talker"),
-        "assistant-control-spawn.log",
-    )
-    os.makedirs(os.path.dirname(log), exist_ok=True)
-    with open(log, "ab") as out:
-        subprocess.Popen(
-            argv,
-            cwd=ROOT,
-            env=child_env,
-            stdin=subprocess.DEVNULL,
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    return _wait_for_socket(path, time.monotonic() + SPAWN_WAIT_S)
+    log = _spawn_log_path()
+    try:
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+    except OSError as e:
+        return (None, log, f"cannot create spawn log dir: {e}")
+    child_env["CAT_TALKER_LOCK_FD"] = str(lock_fd)
+    try:
+        with open(log, "ab") as out:
+            proc = subprocess.Popen(
+                argv,
+                cwd=ROOT,
+                env=child_env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                pass_fds=(lock_fd,),
+            )
+    except OSError as e:
+        return (None, log,
+                f"cannot spawn assistant ({argv[0] if argv else '?'}): {e}")
+    except ValueError as e:
+        return (None, log, f"cannot spawn assistant: {e}")
+    return (proc, log, "")
+
+
+def _await_child_socket(path, proc, log):
+    """Wait for the child's control socket; report real failures.
+
+    Returns (True, "") on readiness, else (False, reason). A child that
+    exits before serving is reported with its exit code and the tail of
+    its captured log - never a bare "did not come up".
+    """
+    deadline = time.monotonic() + SPAWN_WAIT_S
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return (False,
+                    f"assistant exited (code {proc.returncode}) before "
+                    f"the control socket answered. Log tail ({log}):\n"
+                    f"{_log_tail(log)}")
+        reply = _try_forward("status", path)
+        if reply is not None and reply.get("ok"):
+            return (True, "")
+        time.sleep(0.2)
+    if proc.poll() is not None:
+        return (False,
+                f"assistant exited (code {proc.returncode}) while waiting "
+                f"for the control socket. Log tail ({log}):\n{_log_tail(log)}")
+    return (False,
+            f"assistant did not answer within {SPAWN_WAIT_S:.0f}s "
+            f"(still running, pid {proc.pid}). Log: {log}\n{_log_tail(log)}")
+
+
+def _log_tail(log):
+    try:
+        with open(log, "rb") as f:
+            try:
+                f.seek(-LOG_TAIL_BYTES, os.SEEK_END)
+            except OSError:
+                pass
+            return f.read().decode("utf-8", errors="replace")
+    except OSError as e:
+        return f"<unreadable spawn log: {e}>"
 
 
 def main(argv):
@@ -110,7 +164,12 @@ def main(argv):
         return 0
 
     # Not answering: take the spawn lock, recheck (another launcher may
-    # have won), drop a stale socket, start exactly one instance.
+    # have won), drop a stale socket, spawn exactly one instance, and
+    # wait for readiness while STILL holding the lock. This is safe
+    # because the lock fd is inherited by the child, which adopts it as
+    # its runtime ownership: rival launchers block (attaching via the
+    # recheck below once the socket answers) instead of spawning
+    # duplicates, and the child never deadlocks on startup.
     lockf = lock_path(runtime)
     with open(lockf, "a+b") as lock:
         deadline = time.monotonic() + LOCK_TIMEOUT_S
@@ -123,6 +182,12 @@ def main(argv):
                     print("assistant-control: spawn lock busy",
                           file=sys.stderr)
                     return 1
+                # A live child may be starting right now: if its socket
+                # answers, attach to it instead of waiting on the lock.
+                reply = _try_forward(cmd, path)
+                if reply is not None and reply.get("ok"):
+                    print(reply.get("state", "ok"))
+                    return 0
                 time.sleep(0.1)
         try:
             reply = _try_forward(cmd, path)
@@ -134,9 +199,13 @@ def main(argv):
                 os.unlink(path)
             except OSError:
                 pass
-            if not _launch_once(path):
-                print("assistant-control: assistant did not come up",
-                      file=sys.stderr)
+            proc, log, error = _spawn_child(path, lock.fileno())
+            if proc is None:
+                print(f"assistant-control: {error}", file=sys.stderr)
+                return 1
+            ok, reason = _await_child_socket(path, proc, log)
+            if not ok:
+                print(f"assistant-control: {reason}", file=sys.stderr)
                 return 1
             reply = _try_forward(cmd, path)
             if reply is not None and reply.get("ok"):

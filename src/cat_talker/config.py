@@ -90,7 +90,19 @@ def get_voice_approval() -> bool:
 
 
 def get_echo_suppress() -> bool:
-    """Get echo-suppression-of-speaker-audio setting (default on)."""
+    """Get echo-suppression-of-speaker-audio setting (default on).
+
+    Environment override for controlled experiments (no DSP change):
+    CAT_TALKER_ECHO_SUPPRESS=0/false/no/off disables, =1/true/yes/on
+    enables. Unset (or anything else) falls back to the config file.
+    AudioInterface reads this once at construction, so changing it
+    requires a process restart (F3 quit + start).
+    """
+    override = os.environ.get("CAT_TALKER_ECHO_SUPPRESS", "").strip().lower()
+    if override in ("0", "false", "no", "off"):
+        return False
+    if override in ("1", "true", "yes", "on"):
+        return True
     config = load_config()
     return config.get("echo_suppress_enabled", True)
 
