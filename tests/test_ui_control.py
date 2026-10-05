@@ -261,7 +261,7 @@ def test_menu_keeps_working_items():
     window = get_overlay_window()
     _, actions, _ = _menu(window)
     assert set(actions) == {"pin", "bottom_center", "bottom_right",
-                            "center", "hide", "capture", "quit"}
+                            "center", "hide", "settings", "capture", "quit"}
 
 
 def test_menu_hide_works():

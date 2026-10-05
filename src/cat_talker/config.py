@@ -70,6 +70,33 @@ def get_api_key() -> Optional[str]:
     return config.get("api_key") or os.environ.get("GEMINI_API_KEY")
 
 
+def is_api_key_configured() -> bool:
+    """Whether an API key is available (config file or environment)."""
+    return bool(get_api_key())
+
+
+def set_api_key(key: str) -> str:
+    """Store a replacement API key in the config file. Never logs it."""
+    if not isinstance(key, str) or not key.strip():
+        return "Error: API key must not be empty."
+    config = load_config()
+    config["api_key"] = key.strip()
+    result = save_config(config)
+    if result.startswith("Configuration saved"):
+        return "API key updated."
+    return result
+
+
+def clear_api_key() -> str:
+    """Remove the API key stored in the config file (env var untouched)."""
+    config = load_config()
+    config["api_key"] = ""
+    result = save_config(config)
+    if result.startswith("Configuration saved"):
+        return "Stored API key removed."
+    return result
+
+
 def get_preferred_monitor() -> str:
     """Get the preferred monitor name for capture."""
     config = load_config()

@@ -43,6 +43,15 @@ def available() -> bool:
         return False
 
 
+def builtin_models():
+    """Built-in openwakeword model keys (empty when backend missing)."""
+    try:
+        import openwakeword
+        return frozenset((openwakeword.models or {}).keys())
+    except Exception:
+        return frozenset()
+
+
 # Loaded onnx sessions cached by model path: every sleep entry would
 # otherwise pay a seconds-long reload for the same file. Inference
 # sessions are safe for sequential use; detectors run one at a time

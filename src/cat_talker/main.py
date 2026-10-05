@@ -9,6 +9,8 @@ import threading
 import math
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import QWidget, QMenu, QMessageBox, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import (QDialog, QCheckBox, QLineEdit, QDoubleSpinBox,
+                             QFormLayout, QDialogButtonBox)
 from PyQt6.QtGui import QPainter, QColor, QBrush, QAction, QPen, QFont, QPainterPath, QPixmap
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, QPointF, QEasingCurve, QPropertyAnimation, pyqtProperty
 
@@ -24,6 +26,147 @@ COLORS = {
     "bubble_bg": QColor(30, 30, 40, 230),
     "bubble_text": QColor(240, 240, 245),
 }
+
+class SettingsDialog(QDialog):
+    """Chibi settings over the existing config/memory boundaries.
+
+    Same process, same window hierarchy (parented to the overlay): no
+    second application instance, main thread only. Save validates every
+    field first - nothing persists when anything is invalid. Wake-word
+    edits apply on the next sleep cycle (the detector reads config per
+    nap); F2 always keeps working.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from cat_talker import settings as settings_mod
+        self._settings_mod = settings_mod
+        self.setWindowTitle("Chibi Settings")
+        self.setMinimumWidth(380)
+        self.setStyleSheet(
+            "QDialog { background-color: #1e1e28; }"
+            "QLabel { color: #f0f0f5; }"
+            "QCheckBox { color: #f0f0f5; }"
+            "QLineEdit, QDoubleSpinBox { background-color: #2a2a38; "
+            "color: #f0f0f5; border: 1px solid #4a4a5a; "
+            "border-radius: 4px; padding: 3px; }"
+            "QPushButton { background-color: #3a3a4c; color: #f0f0f5; "
+            "border-radius: 4px; padding: 5px 14px; }"
+            "QPushButton:hover { background-color: #4a4a5e; }")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.wake_enabled = QCheckBox("Listen for the wake phrase while asleep")
+        self.wake_enabled.setToolTip(
+            "Optional and off by default. F2 always wakes manually.")
+        self.wake_phrase = QLineEdit()
+        self.wake_model = QLineEdit()
+        self.wake_model.setToolTip(
+            "Built-in model key (e.g. hey_jarvis) or a custom .onnx path.")
+        self.wake_threshold = QDoubleSpinBox()
+        self.wake_threshold.setRange(0.01, 1.0)
+        self.wake_threshold.setSingleStep(0.05)
+        self.wake_threshold.setDecimals(2)
+        self.monitor = QLineEdit()
+        self.voice_approval = QCheckBox("Ask before risky actions")
+        self.echo_suppress = QCheckBox("Suppress speaker echo from mic")
+        self.auto_reconnect = QCheckBox("Auto-reconnect on drops")
+        self.language = QLineEdit()
+        self.response_style = QLineEdit()
+        self.weather_location = QLineEdit()
+        self.api_status = QLabel()
+        self.api_new = QLineEdit()
+        self.api_new.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_new.setPlaceholderText("Paste a replacement key here")
+        self.api_clear = QCheckBox("Remove the stored key on save")
+        form.addRow("Wake word", self.wake_enabled)
+        form.addRow("Wake phrase", self.wake_phrase)
+        form.addRow("Wake model", self.wake_model)
+        form.addRow("Wake threshold", self.wake_threshold)
+        form.addRow("Preferred monitor", self.monitor)
+        form.addRow("Voice approval", self.voice_approval)
+        form.addRow("Echo suppression", self.echo_suppress)
+        form.addRow("Auto-reconnect", self.auto_reconnect)
+        form.addRow("Language", self.language)
+        form.addRow("Response style", self.response_style)
+        form.addRow("Weather location", self.weather_location)
+        form.addRow("API key", self.api_status)
+        form.addRow("New API key", self.api_new)
+        form.addRow("", self.api_clear)
+        layout.addLayout(form)
+        note = QLabel("Wake-word changes apply on the next sleep cycle. "
+                      "F2 always wakes manually.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.error_label = QLabel()
+        self.error_label.setStyleSheet("QLabel { color: #ff8080; }")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.load_from_snapshot(settings_mod.load_snapshot())
+
+    def load_from_snapshot(self, snapshot):
+        """Fill widgets from a settings snapshot (dict)."""
+        self.wake_enabled.setChecked(bool(snapshot.get("wake_word_enabled", False)))
+        self.wake_phrase.setText(str(snapshot.get("wake_word_phrase", "")))
+        self.wake_model.setText(str(snapshot.get("wake_word_model", "")))
+        try:
+            self.wake_threshold.setValue(float(snapshot.get("wake_word_threshold", 0.5)))
+        except (TypeError, ValueError):
+            self.wake_threshold.setValue(0.5)
+        self.monitor.setText(str(snapshot.get("preferred_monitor", "")))
+        self.voice_approval.setChecked(bool(snapshot.get("voice_approval_enabled", True)))
+        self.echo_suppress.setChecked(bool(snapshot.get("echo_suppress_enabled", True)))
+        self.auto_reconnect.setChecked(bool(snapshot.get("auto_reconnect", True)))
+        self.language.setText(str(snapshot.get("preferred_language", "")))
+        self.response_style.setText(str(snapshot.get("response_style", "")))
+        self.weather_location.setText(str(snapshot.get("weather_location", "")))
+        if snapshot.get("api_key_configured"):
+            self.api_status.setText("Configured (value hidden)")
+        else:
+            self.api_status.setText("Not configured")
+        self.api_new.clear()
+        self.api_clear.setChecked(False)
+        self.error_label.hide()
+
+    def gather_values(self):
+        """Read widgets into a snapshot-shaped dict (no persistence)."""
+        return {
+            "wake_word_enabled": self.wake_enabled.isChecked(),
+            "wake_word_phrase": self.wake_phrase.text(),
+            "wake_word_model": self.wake_model.text(),
+            "wake_word_threshold": self.wake_threshold.value(),
+            "preferred_monitor": self.monitor.text(),
+            "voice_approval_enabled": self.voice_approval.isChecked(),
+            "echo_suppress_enabled": self.echo_suppress.isChecked(),
+            "auto_reconnect": self.auto_reconnect.isChecked(),
+            "preferred_language": self.language.text(),
+            "response_style": self.response_style.text(),
+            "weather_location": self.weather_location.text(),
+            "api_key_new": self.api_new.text(),
+            "api_key_clear": self.api_clear.isChecked(),
+        }
+
+    def _on_save(self):
+        values = self.gather_values()
+        errors = self._settings_mod.validate_settings(values)
+        if errors:
+            self.error_label.setText("; ".join(errors))
+            self.error_label.show()
+            return
+        ok, message = self._settings_mod.apply_settings(values)
+        if not ok:
+            self.error_label.setText(message)
+            self.error_label.show()
+            return
+        self.error_label.hide()
+        self.accept()
+
 
 class RadialVisualizerWindow(QWidget):
     # Signals from agent thread
@@ -451,6 +594,7 @@ class RadialVisualizerWindow(QWidget):
         menu.addSeparator()
 
         act_hide = menu.addAction("👁️ Hide UI")
+        act_settings = menu.addAction("⚙️ Settings")
         act_capture = menu.addAction("📸 Capture Active Window (pkill -SIGUSR2)")
         act_quit = menu.addAction("❌ Quit Assistant")
 
@@ -460,6 +604,7 @@ class RadialVisualizerWindow(QWidget):
             "bottom_right": act_bottom_right,
             "center": act_center,
             "hide": act_hide,
+            "settings": act_settings,
             "capture": act_capture,
             "quit": act_quit,
         }
@@ -483,11 +628,23 @@ class RadialVisualizerWindow(QWidget):
             self.position_center()
         elif action == actions["hide"]:
             self.hide()
+        elif action == actions["settings"]:
+            self.open_settings()
         elif action == actions["capture"]:
             # Re-use the existing logic by sending SIGUSR2 to ourselves
             os.kill(os.getpid(), signal.SIGUSR2)
         elif action == actions["quit"]:
             QApplication.quit()
+
+    def open_settings(self):
+        """Show the settings dialog (main thread, modal, same process).
+
+        Parented to the overlay: no second application or window
+        instance. Modal exec() pumps the main-thread event loop, so the
+        UI stays responsive and no worker ever touches these widgets.
+        """
+        dialog = SettingsDialog(self)
+        dialog.exec()
 
     def contextMenuEvent(self, event):
         menu, actions = self._build_context_menu()
