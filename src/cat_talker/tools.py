@@ -688,20 +688,58 @@ def focus_or_launch(app_name: str) -> str:
     except Exception as e:
         return f"Error focusing/launching {app_name}: {e}"
 
+def _hyprctl_active_workspace_id(timeout: int = 5):
+    """Return the active Hyprland workspace id, or None if unknown."""
+    try:
+        res = subprocess.run(
+            ["hyprctl", "activeworkspace", "-j"],
+            capture_output=True, text=True, timeout=timeout)
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        data = json.loads(res.stdout)
+        wid = data.get("id", data.get("workspaceID", None))
+        return int(wid)
+    except Exception:
+        return None
+
+
 def switch_workspace(workspace_num: int) -> str:
-    """Switches to a specific Hyprland workspace.
-    
+    """Switches to a specific Hyprland workspace (1-6 supported).
+
+    Uses the Lua dispatcher interface of this Hyprland installation
+    (`hl.dsp.focus({ workspace = "N" })` through `hyprctl eval`).
+    The workspace number is validated as an integer and clamped to
+    1-10 before interpolation, so no arbitrary text can reach the Lua
+    expression. Success is verified with `hyprctl activeworkspace -j`;
+    exit code 0 alone is never reported as success.
+
     Args:
         workspace_num: Workspace number (1-10 typically).
     """
     try:
-        if shutil.which("hyprctl"):
-            workspace_num = max(1, min(10, workspace_num))  # Clamp to reasonable range
-            subprocess.run(["hyprctl", "eval", f"hl.dispatch(hl.dsp.exec_raw('workspace {workspace_num}'))"], check=True)
-            return f"Switched to workspace {workspace_num}."
+        workspace_num = int(workspace_num)
+    except (TypeError, ValueError):
+        return "Error: workspace number must be an integer (1-10)."
+    if not shutil.which("hyprctl"):
         return "Error: hyprctl not found."
+    workspace_num = max(1, min(10, workspace_num))  # Clamp to supported range
+    try:
+        subprocess.run(
+            ["hyprctl", "eval",
+             f"hl.dispatch(hl.dsp.focus({{ workspace = \"{workspace_num}\" }}))"],
+            capture_output=True, text=True, timeout=10, check=True)
+    except subprocess.CalledProcessError as e:
+        return f"Error switching workspace: hyprctl dispatch failed: {e}"
     except Exception as e:
         return f"Error switching workspace: {e}"
+    active = _hyprctl_active_workspace_id()
+    if active == workspace_num:
+        return f"Switched to workspace {workspace_num}."
+    if active is None:
+        return (f"Workspace dispatch sent for workspace {workspace_num}, "
+                f"but the active workspace could not be verified.")
+    return (f"Workspace switch to {workspace_num} did not take effect "
+            f"(active workspace is {active}).")
 
 def media_action(command: str) -> str:
     """Controls media playback via playerctl.

@@ -38,6 +38,31 @@ SIDE_EFFECT_TOOLS = frozenset({
 })
 
 # Maximum fetch_webpage calls per user interaction (resets each turn).
+
+# Tools whose SUCCESS opens or focuses another window: after a verified
+# successful execution the avatar UI auto-hides (visibility only - the
+# agent stays awake and listening). Anything not listed here never
+# auto-hides. open_application/open_website/open_file/focus_or_launch
+# report "Successfully ..."/"Opened ..."/"Focused existing ..."; failures
+# report "Error ..."/"Failed ...". auto_hide_succeeded() is the single
+# success gate - an error result must never hide the UI.
+AUTO_HIDE_TOOLS = frozenset({
+    "open_application", "open_website", "open_file",
+    "focus_or_launch", "search_and_play_youtube",
+})
+
+_AUTO_HIDE_SUCCESS_PREFIXES = (
+    "Successfully opened", "Opened website", "Focused existing",
+)
+
+
+def auto_hide_succeeded(tool_name, result) -> bool:
+    """True only for a successful AUTO_HIDE_TOOLS result string."""
+    return (
+        tool_name in AUTO_HIDE_TOOLS
+        and isinstance(result, str)
+        and result.startswith(_AUTO_HIDE_SUCCESS_PREFIXES)
+    )
 MAX_FETCH_PER_INTERACTION = 3
 
 # Short explicit confirmations that are always actionable as turns.
@@ -101,7 +126,8 @@ def build_system_instructions():
         "You have direct access to the user's computer via tools! You can open apps, open websites in browser, "
         "read the clipboard (including currently highlighted text via primary_selection=True), check the active window, set the volume, set brightness, take screenshots, "
         "check the local date and time, search the current web, fetch web pages as readable text, "
-        "control media, switch workspaces, and send notifications. "
+        "control media, switch workspaces (1-6: 'switch to workspace 5', "
+        "'go to workspace 6', 'workspace 3 par switch karo'), and send notifications. "
         "YOU HAVE VISION ON DEMAND - when the user asks you to look at something, use the take_screenshot tool "
         "to capture the screen and analyze it. "
         "COORDINATE CONTRACT: every screenshot states its EXACT pixel dimensions (e.g. 1536x960). "
@@ -295,6 +321,28 @@ class GeminiDesktopAgent:
     def _set_glow(self, glow_callback, state: str):
         if glow_callback:
             glow_callback(state)
+
+    def _maybe_auto_hide(self, tool_name, result, hide_callback) -> bool:
+        """Hide the avatar UI after a successful window-opening tool.
+
+        Visibility only: never touches sleep state, media, or the mic.
+        The hide request goes through the UiBridge (queued Qt signal),
+        so this is safe from the agent thread and never blocks. Returns
+        True when a hide was requested. Duplicate/replayed tool results
+        never reach here - the caller invokes this only on the fresh
+        (classification=NEW) execution path.
+        """
+        if hide_callback is None:
+            return False
+        if not auto_hide_succeeded(tool_name, result):
+            return False
+        try:
+            hide_callback()
+        except Exception:
+            logger.warning("auto-hide hide_callback failed", exc_info=True)
+            return False
+        logger.info(f"auto-hide: UI hidden after {tool_name}")
+        return True
 
     def _start_new_interaction(self, seen_signatures=None):
         """Begin a new user interaction: reset per-turn budgets.
@@ -593,7 +641,8 @@ class GeminiDesktopAgent:
         return self.request_sleep()
 
     async def run_loop(self, volume_callback=None, app_quit_callback=None, text_callback=None,
-                       state_callback=None, bubble_callback=None, glow_callback=None):
+                       state_callback=None, bubble_callback=None, glow_callback=None,
+                       hide_callback=None):
         self.loop = asyncio.get_running_loop()
         # Reuse the existing AudioInterface (hardware) across reconnects instead
         # of creating a new one per session.
@@ -1269,6 +1318,15 @@ class GeminiDesktopAgent:
                                                             logger.info(f"🛠️ Executed {function_call.name}: {result}")
 
                                                         result_dict = {"result": result}
+                                                        # Auto-hide: a successful window-opening
+                                                        # tool hides the avatar UI (visibility
+                                                        # only - never sleeps). Error results,
+                                                        # blocked/duplicate calls, and all other
+                                                        # tools never reach this NEW-execution
+                                                        # path with a success string, so no hide.
+                                                        self._maybe_auto_hide(
+                                                            function_call.name, result,
+                                                            hide_callback)
                                                         if function_call.name == "click_screen" and isinstance(args, dict):
                                                             # Record executed clicks for post-click
                                                             # verification: only real dispatches
@@ -1525,7 +1583,7 @@ class GeminiDesktopAgent:
             if app_quit_callback:
                 app_quit_callback()
 
-def start_agent_in_thread(volume_cb, quit_cb=None, text_cb=None, state_cb=None, bubble_cb=None, glow_cb=None, global_agent_ref=None):
+def start_agent_in_thread(volume_cb, quit_cb=None, text_cb=None, state_cb=None, bubble_cb=None, glow_cb=None, global_agent_ref=None, hide_cb=None):
     agent = GeminiDesktopAgent()
     if global_agent_ref is not None:
         global_agent_ref.append(agent)
@@ -1533,7 +1591,7 @@ def start_agent_in_thread(volume_cb, quit_cb=None, text_cb=None, state_cb=None, 
     asyncio.set_event_loop(loop)
     agent.loop = loop
     task = loop.create_task(
-        agent.run_loop(volume_cb, quit_cb, text_cb, state_cb, bubble_cb, glow_cb)
+        agent.run_loop(volume_cb, quit_cb, text_cb, state_cb, bubble_cb, glow_cb, hide_cb)
     )
     agent._run_task = task
     # A stop requested before the task was published (request_stop() saw no

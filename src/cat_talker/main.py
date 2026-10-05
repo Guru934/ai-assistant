@@ -724,7 +724,10 @@ def main():
 
     agent_thread = threading.Thread(
         target=start_agent_in_thread,
-        args=(on_volume, on_quit, on_text, on_state, on_bubble, on_glow, global_agent),
+        # hide_cb is UiBridge.hide: a queued Qt signal, so the agent
+        # thread's auto-hide request marshals onto the main thread and
+        # never touches widgets off-thread. Visibility only, not sleep.
+        args=(on_volume, on_quit, on_text, on_state, on_bubble, on_glow, global_agent, ui_bridge.hide),
         daemon=True
     )
     agent_thread.start()
