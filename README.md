@@ -116,6 +116,13 @@ Prerequisites (system packages): `grim`, `ydotool` + running `ydotoold`
 microphone + speakers (PipeWire), Hyprland for the global shortcuts.
 Python deps live in the repo venv (`.venv`).
 
+Input backend: computer-use injection uses the packaged `ydotool.service`
+user unit (`/usr/bin/ydotoold`, persists across logins while enabled with
+systemd lingering). Check it with `bin/assistant-control ydotool-status`;
+enable/start it explicitly with `bin/assistant-ydotool-setup` (user level
+only, never sudo). Click/type/key failures name the exact cause
+(ydotool missing, daemon stopped, permission/uinput problem).
+
 Configuration: a Gemini API key via `GEMINI_API_KEY` env or
 `~/.config/cat-talker/config.json` (`api_key`). Without a key the app
 exits with an error dialog instead of starting broken.

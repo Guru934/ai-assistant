@@ -85,9 +85,13 @@ playerctl, subprocess, network).
   - **Echo suppression/audio isolation is improved but defensive, not
     a perfect guarantee** against loud external audio. Live-mic
     validation across wake cycles is still real-world-pending.
-  - **Generic visual clicking is best-effort.** Grounding can miss;
-    bounded by max-2-alternate retry, then the assistant asks the user.
-    Requires `ydotoold` + `input` group.
+   - **Generic visual clicking is best-effort.** Grounding can miss;
+     bounded by max-2-alternate retry, then the assistant asks the user.
+     Requires `ydotoold` + `input` group. Backend health is explicit:
+     `bin/assistant-control ydotool-status` reports
+     healthy/missing/stopped/unusable/permission without performing
+     input; `bin/assistant-ydotool-setup` enables the packaged user
+     service (explicit, user-level, never sudo).
   - **No voice wake-word while sleeping (F2 required);** Hyprland needed
     for global keys; needs network + valid Gemini API key.
   - **The coding worker has NO OS-level sandbox.** The boundary is

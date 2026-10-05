@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Explicit one-time ydotool backend setup for this machine.
+
+What it does (user level only, never sudo, never root):
+  1. Verifies `ydotool` and `ydotoold` are on PATH.
+  2. Verifies this user can open /dev/uinput (else prints the fix and stops).
+  3. Enables the packaged `ydotool.service` USER unit (persists across
+     login/reboots together with systemd lingering) and starts it now.
+  4. Re-checks backend health and reports the result.
+
+Run it yourself when `assistant-control ydotool-status` reports the daemon
+stopped/unusable. Chibi never runs this on its own.
+"""
+
+import os
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from cat_talker.ydotool_health import (  # noqa: E402
+    PERMISSION,
+    SERVICE_NAME,
+    check_ydotool_health,
+    format_ydotool_status,
+)
+
+
+def _run(argv):
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def main():
+    health = check_ydotool_health()
+    if health.status == PERMISSION:
+        print(f"cannot proceed: {health.detail}")
+        print(f"fix: {health.hint}")
+        return 1
+    if health.status in ("ydotool_missing", "daemon_missing"):
+        print(f"cannot proceed: {health.detail}")
+        print(f"fix: {health.hint}")
+        return 1
+    code, out = _run(["systemctl", "--user", "reset-failed", SERVICE_NAME])
+    code, out = _run(["systemctl", "--user", "enable", "--now", SERVICE_NAME])
+    if code != 0:
+        print(f"failed to enable/start {SERVICE_NAME}:\n{out}")
+        print("see: journalctl --user -u ydotool.service")
+        return 1
+    text, status_code = format_ydotool_status()
+    print(text)
+    if status_code != 0:
+        print("setup ran but the backend is still unhealthy; "
+              "see: journalctl --user -u ydotool.service")
+        return 1
+    print(f"backend ready (persists via enabled user unit {SERVICE_NAME}).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

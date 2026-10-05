@@ -68,11 +68,13 @@ def _which(*names):
     return fake_which
 
 
-def _click_twice(x, y):
+def _click_twice(x, y, desc=""):
     """Drive through the voice-approval gate: 1st call pauses, identical
-    2nd call executes."""
-    tools_mod.click_screen(x, y)
-    return tools_mod.click_screen(x, y)
+    2nd call executes. Coordinates are grounded on the current frame
+    (geometry must already be recorded by the caller)."""
+    seq = tools_mod.get_frame_seq()
+    tools_mod.click_screen(x, y, desc, frame_seq=seq)
+    return tools_mod.click_screen(x, y, desc, frame_seq=seq)
 
 
 @pytest.fixture
@@ -255,7 +257,9 @@ def test_non_hyprland_fallback_uses_ydotool_move(risky_reset):
 
 def test_click_approval_uses_semantic_description(risky_reset):
     """Spoken approval names the target, never raw coordinates."""
-    res = tools_mod.click_screen(73, 633, "History link")
+    tools_mod.set_coordinate_geometry(GEOM_1080P)
+    seq = tools_mod.get_frame_seq()
+    res = tools_mod.click_screen(73, 633, "History link", frame_seq=seq)
     assert "History link" in res, res
     assert "Do you confirm I should click the History link?" in res, res
     assert "73" not in res and "633" not in res, res
@@ -263,29 +267,34 @@ def test_click_approval_uses_semantic_description(risky_reset):
 
 def test_click_approval_fallback_hides_coordinates(risky_reset):
     """Empty/blank description falls back without exposing coordinates."""
+    tools_mod.set_coordinate_geometry(GEOM_1080P)
+    seq = tools_mod.get_frame_seq()
     for desc in ("", "   "):
         tools_mod.PENDING_RISKY_ACTION = None
-        res = tools_mod.click_screen(10, 20, desc)
+        res = tools_mod.click_screen(10, 20, desc, frame_seq=seq)
         assert "click the selected screen location" in res, res
         assert "10" not in res and "20" not in res, res
 
 
 def test_confirmation_executes_original_coordinates(risky_reset):
-    """confirm_action runs exactly the x/y bound at approval time."""
+    """confirm_action runs exactly the x/y bound at approval time (image
+    (512,288) on the 1080p frame maps to global (960,540))."""
     seen = []
     with patch.object(tools_mod.shutil, "which",
                       side_effect=_which("hyprctl", "ydotool")), \
          patch("subprocess.run",
-               side_effect=_hyprland_run(seen, cursorpos="73, 633")):
-        tools_mod.set_coordinate_geometry(None)  # passthrough: global == image
-        approval = tools_mod.click_screen(73, 633, "History link")
+               side_effect=_hyprland_run(seen, cursorpos="960, 540")):
+        tools_mod.set_coordinate_geometry(GEOM_1080P)
+        seq = tools_mod.get_frame_seq()
+        approval = tools_mod.click_screen(512, 288, "History link",
+                                          frame_seq=seq)
         assert "History link" in approval
         result = tools_mod.confirm_action()
     moves = [c for c in seen
              if len(c) == 3 and c[:2] == ["hyprctl", "dispatch"]
              and c[2].startswith("hl.dsp.cursor.move(")]
-    assert moves and moves[0][2] == "hl.dsp.cursor.move({x = 73, y = 633})", moves
-    assert "cursor verified at (73, 633)" in result, result
+    assert moves and moves[0][2] == "hl.dsp.cursor.move({x = 960, y = 540})", moves
+    assert "cursor verified at (960, 540)" in result, result
 
 
 def test_type_text_reports_ydotool_failure(risky_reset):
@@ -303,7 +312,8 @@ def test_type_text_reports_ydotool_failure(risky_reset):
         with patch("subprocess.run", side_effect=boom):
             tools_mod.type_text("hi")
             bad = tools_mod.type_text("hi")
-        assert "Failed to type" in bad and "1" in bad, bad
+        assert "dispatch failed" in bad and "1" in bad, bad
+        assert "NOT performed" in bad, bad
 
 
 # ---------------------------------------------------------------------------

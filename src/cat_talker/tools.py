@@ -465,17 +465,34 @@ def search_and_play_youtube(query: str) -> str:
 # inspections; see cat_talker.vision). The agent records each sent frame's
 # geometry here; click_screen converts to global layout pixels before
 # touching the cursor. Never assume (0,0).
+#
+# Stale-frame protection: every recorded frame gets a monotonically
+# increasing sequence number. click_screen must be given the frame_seq
+# stated with the screenshot its coordinates came from; a missing or
+# superseded seq is an honest failure, never a silent stale click.
 _COORDINATE_GEOMETRY = None
+_FRAME_SEQ = 0
 
 
 def set_coordinate_geometry(geometry):
-    """Remember the geometry of the frame Gemini is currently seeing."""
-    global _COORDINATE_GEOMETRY
+    """Remember the geometry of the frame Gemini is currently seeing.
+
+    Call ONLY when a frame is actually sent to the model. Returns the new
+    frame sequence number to state with that frame.
+    """
+    global _COORDINATE_GEOMETRY, _FRAME_SEQ
     _COORDINATE_GEOMETRY = dict(geometry) if geometry else None
+    _FRAME_SEQ += 1
+    return _FRAME_SEQ
 
 
 def get_coordinate_geometry():
     return _COORDINATE_GEOMETRY
+
+
+def get_frame_seq():
+    """Sequence number of the most recently recorded frame (0 = none)."""
+    return _FRAME_SEQ
 
 
 def convert_click_coordinates(x: int, y: int):
@@ -526,7 +543,94 @@ def _hyprctl_failure(what: str, e: subprocess.CalledProcessError) -> str:
     return f"{what} failed (exit {e.returncode}): {detail}"
 
 
-def click_screen(x: int, y: int, target_description: str = "") -> str:
+# Substrings of ydotool output meaning "the binary ran but the daemon did
+# not answer". ydotool reports this on STDOUT (not stderr) with exit 2,
+# e.g. "failed to connect socket `/run/user/1000/.ydotool_socket': No
+# such file or directory / Please check if ydotoold is running." - so
+# both streams are always examined. Never auto-start ydotoold here: no
+# privileged escalation, no sudo, no background daemon management.
+_YDOTOOLD_MARKERS = ("ydotoold", "failed to connect", ".ydotool_socket")
+
+
+def _daemon_hint():
+    """Refine a daemon failure with the deterministic health state.
+
+    Best-effort only: any error returns "". Never raises, never performs
+    input, never manages services.
+    """
+    try:
+        from cat_talker.ydotool_health import (
+            DAEMON_STOPPED, DAEMON_UNREACHABLE, DAEMON_UNUSABLE,
+            PERMISSION, check_ydotool_health,
+        )
+        health = check_ydotool_health()
+        if health.status == PERMISSION and health.hint:
+            return f" Likely permission cause: {health.hint}"
+        if health.status in (DAEMON_STOPPED, DAEMON_UNREACHABLE,
+                             DAEMON_UNUSABLE) and health.hint:
+            return f" {health.hint}"
+        return ""
+    except Exception:
+        return ""
+
+
+def _ydotool_dispatch(argv, what: str, timeout: int = 10):
+    """Run one ydotool command, distinguishing availability states.
+
+    Returns None when the action was actually dispatched (zero exit).
+    Otherwise returns an actionable failure string; one of:
+      (d) ydotool executable missing,
+      (e) ydotoold unavailable (binary ran, daemon did not answer),
+      (f) input dispatch failure (any other non-zero exit/error).
+    A launched-but-unverified subprocess is never reported as success.
+    """
+    if not shutil.which("ydotool"):
+        return (f"{what}: ydotool executable not found. Install ydotool "
+                f"and ensure it is on PATH. {what} NOT performed.")
+    try:
+        subprocess.run(argv, capture_output=True, text=True,
+                       check=True, timeout=timeout)
+        return None
+    except subprocess.CalledProcessError as e:
+        detail = ((e.stdout or "") + "\n" + (e.stderr or "")).strip()
+        if any(m in detail.lower() for m in _YDOTOOLD_MARKERS):
+            return (f"{what}: ydotoold is not running (ydotool exit "
+                    f"{e.returncode}: {detail}). Input injection could not "
+                    f"be performed - start ydotoold and retry.{_daemon_hint()} "
+                    f"{what} NOT performed.")
+        return (f"{what}: ydotool dispatch failed (exit {e.returncode}): "
+                f"{detail or e}. {what} NOT performed.")
+    except FileNotFoundError:
+        return (f"{what}: ydotool executable disappeared at dispatch. "
+                f"{what} NOT performed.")
+    except Exception as e:
+        return f"{what}: input dispatch failed: {e}. {what} NOT performed."
+
+
+def _check_frame_seq(frame_seq):
+    """Stale-frame gate shared by click_screen's pre-approval check and its
+    execution path. Returns an honest failure string, or None when the
+    coordinates are grounded on the current frame."""
+    if frame_seq is None:
+        return ("Stale frame: no frame_seq given. Coordinates must come from "
+                "the CURRENT screenshot - call inspect_screen once and pass "
+                "the frame_seq stated with that frame. Click NOT sent.")
+    try:
+        frame_seq = int(frame_seq)
+    except (TypeError, ValueError):
+        return (f"Stale frame: invalid frame_seq {frame_seq!r}. Pass the "
+                f"integer frame_seq stated with the current screenshot. "
+                f"Click NOT sent.")
+    current = get_frame_seq()
+    if frame_seq != current:
+        return (f"Stale frame: coordinates are grounded on frame #{frame_seq}, "
+                f"but frame #{current} is current. The screen may have changed "
+                f"since - call inspect_screen once for a fresh frame and use "
+                f"its frame_seq. Click NOT sent; stale coordinates NOT reused.")
+    return None
+
+
+def click_screen(x: int, y: int, target_description: str = "", frame_seq=None) -> str:
     """Click at image-space coordinates x, y.
 
     Args:
@@ -538,6 +642,10 @@ def click_screen(x: int, y: int, target_description: str = "") -> str:
             link", "Play button"). Only describe what you actually see;
             leave empty when unsure. Used ONLY for the spoken approval -
             execution always uses the exact x/y above.
+        frame_seq: Sequence number stated with the screenshot these
+            coordinates came from (see the inspect_screen result). Clicks
+            grounded on a superseded frame are refused - re-inspect and use
+            the fresh frame_seq.
         Grounding: locate the FULL clickable region first (thumbnail
             rectangle, button, row) - never text edges, whitespace, borders,
             overlays, scrollbars, or browser chrome unless requested. Click
@@ -546,13 +654,41 @@ def click_screen(x: int, y: int, target_description: str = "") -> str:
             coordinates - pick a different point only with fresh evidence
             (max 2 alternates), then report failure to the user.
     """
-    def _execute(x, y):
+    # Stale-frame gate runs BEFORE voice approval, so a refused click never
+    # consumes an approval turn. Re-validated at execution (confirm_action)
+    # because a newer frame may have superseded this one while paused.
+    stale = _check_frame_seq(frame_seq)
+    if stale is not None:
+        return stale
+    # Validated above: int() cannot fail here.
+    assert frame_seq is not None
+    frame_seq = int(frame_seq)
+    def _execute(x, y, frame_seq=None):
         try:
+            # Re-validate: a fresh inspect may have superseded the frame
+            # while this click waited for voice approval.
+            stale = _check_frame_seq(frame_seq)
+            if stale is not None:
+                return stale
+            # No recorded frame geometry (e.g. no screenshot sent yet): there
+            # is nothing to map image pixels against. Refuse instead of
+            # passing coordinates through unchanged.
+            if get_coordinate_geometry() is None:
+                return ("Coordinate mapping failed for image "
+                        f"({x}, {y}): no screenshot geometry recorded. Call "
+                        f"inspect_screen once and use coordinates from its "
+                        f"stated dimensions. Click NOT sent.")
             if _hyprland_available():
                 # Deterministic compositor-side move. ydotool absolute
                 # movement does not land on Hyprland, so it is NOT used here;
                 # ydotool only performs the button press after verification.
-                gx, gy = convert_click_to_global(x, y)
+                try:
+                    gx, gy = convert_click_to_global(x, y)
+                except Exception as e:
+                    return (f"Coordinate mapping failed for image ({x}, {y}): "
+                            f"{e}. Call inspect_screen once for a fresh frame "
+                            f"and use coordinates from its stated dimensions. "
+                            f"Click NOT sent.")
                 try:
                     subprocess.run(
                         _hyprctl_move_command(gx, gy),
@@ -584,58 +720,65 @@ def click_screen(x: int, y: int, target_description: str = "") -> str:
                     return (f"Cursor move to global ({gx}, {gy}) failed verification: "
                             f"actual ({ax}, {ay}), tolerance {CLICK_TOLERANCE_PX}px. "
                             f"Click NOT sent.")
-                if not shutil.which("ydotool"):
-                    return (f"Cursor verified at ({ax}, {ay}), but ydotool not found. "
-                            f"Click NOT sent.")
-                try:
-                    subprocess.run(["ydotool", "click", "0xC0"], check=True)
-                except Exception as e:
+                err = _ydotool_dispatch(
+                    ["ydotool", "click", "0xC0"],
+                    f"Click at global ({gx}, {gy}) [image ({x}, {y})]")
+                if err is not None:
                     return (f"Cursor verified at ({ax}, {ay}) for global ({gx}, {gy}) "
-                            f"[image ({x}, {y})], but the click failed: {e}.")
+                            f"[image ({x}, {y})], but {err}")
                 return (f"OS click dispatched at global ({gx}, {gy}) [image ({x}, {y})], "
                         f"cursor verified at ({ax}, {ay}) within {CLICK_TOLERANCE_PX}px. "
                         f"Target UI success NOT verified - "
                         f"call inspect_screen once to confirm the UI changed.")
             # Non-Hyprland fallback (pre-existing ydotool absolute path).
-            nx, ny = convert_click_coordinates(x, y)
-            if shutil.which("ydotool"):
-                subprocess.run(["ydotool", "mousemove", "--absolute", str(nx), str(ny)], check=True)
-                subprocess.run(["ydotool", "click", "0xC0"], check=True)
-                return (f"OS click dispatched at native ({nx}, {ny}) "
-                        f"[image ({x}, {y})]. Target success NOT verified - "
-                        f"call inspect_screen once to confirm the UI changed.")
-            return "Error: ydotool not found."
+            try:
+                nx, ny = convert_click_coordinates(x, y)
+            except Exception as e:
+                return (f"Coordinate mapping failed for image ({x}, {y}): "
+                        f"{e}. Click NOT sent.")
+            err = _ydotool_dispatch(
+                ["ydotool", "mousemove", "--absolute", str(nx), str(ny)],
+                f"Cursor move to native ({nx}, {ny}) [image ({x}, {y})]")
+            if err is not None:
+                return err
+            err = _ydotool_dispatch(
+                ["ydotool", "click", "0xC0"],
+                f"Click at native ({nx}, {ny}) [image ({x}, {y})]")
+            if err is not None:
+                return err
+            return (f"OS click dispatched at native ({nx}, {ny}) "
+                    f"[image ({x}, {y})]. Target success NOT verified - "
+                    f"call inspect_screen once to confirm the UI changed.")
         except Exception as e:
             return f"Failed to click: {e}"
     # Approval wording is semantic (never raw coordinates - the user cannot
-    # identify "73, 633" by voice). The exact x/y stay bound in args, so
-    # confirmation executes precisely the originally selected coordinates.
+    # identify "73, 633" by voice). The exact x/y/frame_seq stay bound in
+    # args, so confirmation executes precisely the originally selected
+    # coordinates - and re-validates the frame while executing.
     target = (target_description or "").strip()
     desc = f"click the {target}" if target else "click the selected screen location"
-    return _handle_risky("click_screen", _execute, {"x": x, "y": y}, desc)
+    return _handle_risky("click_screen", _execute, {"x": x, "y": y, "frame_seq": frame_seq}, desc)
 
 def type_text(text: str) -> str:
     def _execute(text):
-        try:
-            if shutil.which("ydotool"):
-                subprocess.run(["ydotool", "type", text], check=True)
-                return f"Successfully typed: {text}"
-            return "Error: ydotool not found."
-        except subprocess.CalledProcessError as e:
-            return f"Failed to type (ydotool exit {e.returncode}): {e}"
-        except Exception as e:
-            return f"Failed to type: {e}"
+        err = _ydotool_dispatch(["ydotool", "type", text],
+                                f"Type {text!r}")
+        if err is not None:
+            return err
+        return f"Successfully typed: {text}"
     return _handle_risky("type_text", _execute, {"text": text}, f"type \"{text}\"")
 
 def press_key(key: str) -> str:
     def _execute(key):
         try:
-            if shutil.which("ydotool"):
-                key_map = {"enter": "28", "esc": "1", "escape": "1", "space": "57", "tab": "15", "backspace": "14", "up": "103", "left": "105", "right": "106", "down": "108", "super": "125", "win": "125", "ctrl": "29", "alt": "56", "shift": "42"}
-                key_code = key_map.get(key.lower(), key.lower())
-                subprocess.run(["ydotool", "key", f"{key_code}:1", f"{key_code}:0"], check=True)
-                return f"Pressed key {key}"
-            return "Error: ydotool not found."
+            key_map = {"enter": "28", "esc": "1", "escape": "1", "space": "57", "tab": "15", "backspace": "14", "up": "103", "left": "105", "right": "106", "down": "108", "super": "125", "win": "125", "ctrl": "29", "alt": "56", "shift": "42"}
+            key_code = key_map.get(key.lower(), key.lower())
+            err = _ydotool_dispatch(
+                ["ydotool", "key", f"{key_code}:1", f"{key_code}:0"],
+                f"Press key {key}")
+            if err is not None:
+                return err
+            return f"Pressed key {key}"
         except Exception as e:
             return f"Failed to press key: {e}"
     return _handle_risky("press_key", _execute, {"key": key}, f"press the {key} key")

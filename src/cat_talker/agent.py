@@ -63,7 +63,114 @@ def auto_hide_succeeded(tool_name, result) -> bool:
         and isinstance(result, str)
         and result.startswith(_AUTO_HIDE_SUCCESS_PREFIXES)
     )
+
+
+def evaluate_click_verification(pending, frame_sig):
+    """Deterministic post-click verification contract.
+
+    pending: the recorded click dict (x, y, desc, base hash) or None.
+    frame_sig: sha hex of the newly inspected frame, or None if unknown.
+
+    Returns (outcome, log_line, verify_note) where outcome is one of:
+      "failed"  - new frame matches the pre-click baseline: the click did
+                  NOT change the screen. Coordinates are proven bad.
+      "changed" - screen changed (or no baseline to compare): this is NOT
+                  target success. The model must still produce visible
+                  evidence that the REQUESTED target was activated.
+      "none"    - no click was pending; nothing to verify.
+    Pure function (no agent state) so the contract is unit-testable.
+    """
+    if pending is not None and pending.get("base") is not None \
+            and frame_sig is not None and frame_sig == pending["base"]:
+        desc = pending.get("desc") or "target"
+        x, y = pending.get("x"), pending.get("y")
+        return ("failed",
+                f"Click verification FAILED for '{desc}' at "
+                f"image ({x}, {y}): screen unchanged.",
+                f" Note: the previous click at image ({x}, {y}) "
+                f"did NOT change the screen - treat it as "
+                f"unsuccessful and do NOT reuse those "
+                f"coordinates.")
+    if pending is not None:
+        desc = pending.get("desc") or "the requested target"
+        return ("changed",
+                "Screen changed after the click, but target "
+                "activation is NOT confirmed.",
+                f" Verification required: did this click "
+                f"successfully activate '{desc}'? "
+                f"Only claim success with visible evidence in "
+                f"the NEW frame above. If the requested target/page "
+                f"is not visibly active, treat the click as "
+                f"unsuccessful.")
+    return ("none", None, "")
 MAX_FETCH_PER_INTERACTION = 3
+
+# Computer-use actions whose execution the multi-step context tracks.
+# Coordinate actions (click_screen) need fresh visual evidence after any
+# executed action; type/press carry no coordinates so they never require
+# a fresh frame themselves, but they still invalidate the current frame
+# for the NEXT click (the screen changed when text was typed).
+CU_ACTIONS = frozenset({"click_screen", "type_text", "press_key"})
+
+# Anti-loop bound: failed computer-use attempts (stale refusals, dispatch
+# failures, verification failures) per user interaction. Approval pauses
+# and blocked guidance answers are not attempts and never count.
+CU_MAX_FAILURES = 5
+
+
+class ComputerUseContext:
+    """Deterministic execution state for multi-step desktop tasks.
+
+    Lives inside the existing agent flow (one per agent, reset per user
+    interaction). Tracks only what sequencing needs: the newest sent
+    frame, the frame a computer-use action last executed against, whether
+    post-action inspection is still owed, and failed attempts. No
+    planning logic: the model still decides every next tool call; this
+    only refuses invalid sequences and bounds retries.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.last_frame_seq = 0
+        self.last_action_seq = 0
+        self.last_action = ""
+        self.verification_pending = False
+        self.failures = 0
+
+    def note_frame_sent(self, seq):
+        """A frame was actually sent to the model; it is now current."""
+        try:
+            seq = int(seq)
+        except (TypeError, ValueError):
+            return
+        if seq > self.last_frame_seq:
+            self.last_frame_seq = seq
+        self.verification_pending = False
+
+    def note_executed(self, name):
+        """A computer-use action dispatched against the current frame."""
+        self.last_action = name
+        self.last_action_seq = self.last_frame_seq
+        self.verification_pending = True
+
+    def note_failure(self):
+        self.failures += 1
+
+    def click_requires_fresh_frame(self) -> bool:
+        """True when a coordinate action must wait for a new inspection:
+        an action already executed against the current frame, so clicking
+        again would re-decide from evidence that action may have changed."""
+        return (self.last_action_seq > 0
+                and self.last_frame_seq <= self.last_action_seq)
+
+    def exhausted(self) -> bool:
+        return self.failures >= CU_MAX_FAILURES
+
+    def screenshot_required(self) -> bool:
+        """True when the next visual step needs a fresh screenshot first."""
+        return self.verification_pending or self.click_requires_fresh_frame()
 
 # Short explicit confirmations that are always actionable as turns.
 _ACTIONABLE_SHORT = frozenset({"yes", "no", "stop", "cancel"})
@@ -134,6 +241,11 @@ def build_system_instructions():
         "Always output x, y in THAT supplied image's pixel coordinates - never any fixed grid, never native "
         "screen pixels. The system converts image coordinates to screen coordinates - never convert yourself. "
         "Use click_screen(x,y) with image pixels plus a truthful target_description. "
+        "Every inspected frame states its frame_seq number: always pass that CURRENT frame's frame_seq to "
+        "click_screen - clicks grounded on any older frame are refused as stale. "
+        "Multi-step desktop tasks run inspect -> act -> inspect: after every click/type/key, call "
+        "inspect_screen once before the next visual step, and never claim the task succeeded until the final "
+        "screen visibly shows the requested end state. "
         "GROUNDING RULES: NEVER infer a UI element's location from memory or common website layouts. "
         "NEVER assume a target (like YouTube History) sits at a fixed coordinate. NEVER reuse a previous "
         "coordinate just because the target has the same name - always locate the target in the CURRENT "
@@ -281,6 +393,9 @@ class GeminiDesktopAgent:
         self._pending_click = None
         self._failed_coords = set()
         self._click_failures = 0
+        # Multi-step computer-use execution context: newest sent frame,
+        # last executed action, pending verification, failure budget.
+        self.cu = ComputerUseContext()
         # Web fetch budget: fetch_webpage calls used in the current user
         # interaction (resets whenever a new user turn starts, alongside
         # _interaction_id / seen_signatures). Per-turn, not lifetime.
@@ -344,6 +459,35 @@ class GeminiDesktopAgent:
         logger.info(f"auto-hide: UI hidden after {tool_name}")
         return True
 
+    def _update_cu_context(self, tool_name, result):
+        """Record a computer-use tool outcome in the execution context.
+
+        Successful dispatches mark the current frame as acted-on (the next
+        coordinate action needs a fresh inspection); failures (stale
+        refusals, dispatch errors, verification failures) count toward the
+        bounded attempt budget. Approval pauses and guidance blocks are
+        not attempts and change nothing.
+        """
+        if tool_name not in CU_ACTIONS or not isinstance(result, str):
+            return
+        if "PAUSED FOR SAFETY" in result or "BLOCKED" in result:
+            return
+        if tool_name == "click_screen":
+            if "dispatched at" in result and "NOT sent" not in result:
+                self.cu.note_executed(tool_name)
+            else:
+                self.cu.note_failure()
+        elif tool_name == "type_text":
+            if result.startswith("Successfully typed"):
+                self.cu.note_executed(tool_name)
+            else:
+                self.cu.note_failure()
+        elif tool_name == "press_key":
+            if result.startswith("Pressed key"):
+                self.cu.note_executed(tool_name)
+            else:
+                self.cu.note_failure()
+
     def _start_new_interaction(self, seen_signatures=None):
         """Begin a new user interaction: reset per-turn budgets.
 
@@ -364,7 +508,13 @@ class GeminiDesktopAgent:
         self._failed_coords = set()
         self._click_failures = 0
         self._fetch_webpage_count = 0
-
+        # Multi-step computer-use execution context (reset per turn;
+        # created here if __init__ never ran, as in lightweight tests).
+        cu = getattr(self, "cu", None)
+        if cu is None:
+            self.cu = ComputerUseContext()
+        else:
+            cu.reset()
     def _consume_fetch_budget(self) -> bool:
         """Consume one fetch_webpage slot. False when the per-turn budget is spent."""
         if getattr(self, "_fetch_webpage_count", 0) >= MAX_FETCH_PER_INTERACTION:
@@ -1106,6 +1256,38 @@ class GeminiDesktopAgent:
                                                         call_id, sig,
                                                     )
                                                     result_dict = seen_signatures[sig]
+                                                elif (function_call.name in CU_ACTIONS
+                                                        and self.cu.exhausted()):
+                                                    logger.info(
+                                                        "🛠️ Tool call interaction=%d name=%s id=%s sig=%s "
+                                                        "classification=BLOCKED_CU_BUDGET",
+                                                        self._interaction_id, function_call.name,
+                                                        call_id, sig,
+                                                    )
+                                                    result_dict = {"result": (
+                                                        f"{function_call.name} BLOCKED: maximum "
+                                                        f"{CU_MAX_FAILURES} failed computer-use attempts "
+                                                        f"this interaction reached (stale frames, dispatch "
+                                                        f"failures, verification failures). STOP the desktop "
+                                                        f"sequence and tell the user out loud what failed "
+                                                        f"instead of retrying.")}
+                                                    record_side_effect = False
+                                                elif (function_call.name == "click_screen"
+                                                        and self.cu.click_requires_fresh_frame()):
+                                                    logger.info(
+                                                        "🛠️ Tool call interaction=%d name=%s id=%s sig=%s "
+                                                        "classification=BLOCKED_NEEDS_INSPECT",
+                                                        self._interaction_id, function_call.name,
+                                                        call_id, sig,
+                                                    )
+                                                    result_dict = {"result": (
+                                                        f"click_screen BLOCKED: the previous desktop action "
+                                                        f"({self.cu.last_action or 'unknown'}) has not been "
+                                                        f"verified yet. Call inspect_screen once for a FRESH "
+                                                        f"frame first, then click using coordinates AND the "
+                                                        f"frame_seq from that new frame. Never click twice "
+                                                        f"from the same screenshot.")}
+                                                    record_side_effect = False
                                                 elif function_call.name == "click_screen" and isinstance(args, dict) and (
                                                         (args.get("x"), args.get("y")) in self._failed_coords):
                                                     logger.info(
@@ -1207,6 +1389,8 @@ class GeminiDesktopAgent:
                                                                     import cat_talker.tools as _tools_mod
                                                                     _tools_mod.set_coordinate_geometry(
                                                                         getattr(self.vision, "last_capture_geometry", None))
+                                                                    self.cu.note_frame_sent(
+                                                                        _tools_mod.get_frame_seq())
                                                                     async with send_lock:
                                                                         await session.send_realtime_input(
                                                                             video=types.Blob(data=frame, mime_type='image/jpeg')
@@ -1225,7 +1409,6 @@ class GeminiDesktopAgent:
                                                                 if frame:
                                                                     import cat_talker.tools as _tools_mod
                                                                     geom = getattr(self.vision, "last_capture_geometry", None)
-                                                                    _tools_mod.set_coordinate_geometry(geom)
                                                                     frame_sig = None
                                                                     if isinstance(frame, (bytes, bytearray)):
                                                                         frame_sig = hashlib.sha256(frame).hexdigest()[:16]
@@ -1239,6 +1422,12 @@ class GeminiDesktopAgent:
                                                                                   "no new frame sent. Act on the previous "
                                                                                   "frame or call a desktop action first.")
                                                                     else:
+                                                                        # Geometry is recorded ONLY for frames
+                                                                        # actually sent: the unchanged-screen guard
+                                                                        # above reuses the previous frame, whose
+                                                                        # frame_seq stays valid.
+                                                                        frame_seq = _tools_mod.set_coordinate_geometry(geom)
+                                                                        self.cu.note_frame_sent(frame_seq)
                                                                         async with send_lock:
                                                                             await session.send_realtime_input(
                                                                                 video=types.Blob(data=frame, mime_type='image/jpeg')
@@ -1246,49 +1435,22 @@ class GeminiDesktopAgent:
                                                                         self._screen_dirty = False
                                                                         pending = self._pending_click
                                                                         self._pending_click = None
-                                                                        verify_note = ""
-                                                                        if (pending is not None
-                                                                                and pending.get("base") is not None
-                                                                                and frame_sig is not None
-                                                                                and frame_sig == pending["base"]):
-                                                                            # Click verification FAILED: the
-                                                                            # post-click screen matches the
-                                                                            # pre-click screen.
+                                                                        outcome, log_line, verify_note = \
+                                                                            evaluate_click_verification(pending, frame_sig)
+                                                                        if outcome == "failed":
                                                                             self._failed_coords.add(
                                                                                 (pending.get("x"), pending.get("y")))
                                                                             self._click_failures += 1
-                                                                            logger.info(
-                                                                                f"Click verification FAILED for "
-                                                                                f"'{pending.get('desc') or 'target'}' at "
-                                                                                f"image ({pending.get('x')}, {pending.get('y')}): "
-                                                                                f"screen unchanged."
-                                                                            )
-                                                                            verify_note = (
-                                                                                f" Note: the previous click at image "
-                                                                                f"({pending.get('x')}, {pending.get('y')}) "
-                                                                                f"did NOT change the screen - treat it as "
-                                                                                f"unsuccessful and do NOT reuse those "
-                                                                                f"coordinates.")
-                                                                        else:
+                                                                            self.cu.note_failure()
+                                                                            logger.info(log_line)
+                                                                        elif outcome == "changed":
                                                                             # Screen changed (or no baseline to compare):
                                                                             # this is NOT target success. Only an unchanged
                                                                             # screen is a proven failure; a changed screen
                                                                             # still needs the model's explicit evidence that
                                                                             # the REQUESTED target was activated. Budget is
                                                                             # intentionally not reset here.
-                                                                            if pending is not None:
-                                                                                logger.info(
-                                                                                    "Screen changed after the click, but target "
-                                                                                    "activation is NOT confirmed."
-                                                                                )
-                                                                                verify_note = (
-                                                                                    f" Verification required: did this click "
-                                                                                    f"successfully activate "
-                                                                                    f"'{pending.get('desc') or 'the requested target'}'? "
-                                                                                    f"Only claim success with visible evidence in "
-                                                                                    f"the NEW frame above. If the requested target/page "
-                                                                                    f"is not visibly active, treat the click as "
-                                                                                    f"unsuccessful.")
+                                                                            logger.info(log_line)
                                                                         self._last_frame_hash = frame_sig
                                                                         iw = (geom or {}).get("img_w", "?")
                                                                         ih = (geom or {}).get("img_h", "?")
@@ -1300,6 +1462,9 @@ class GeminiDesktopAgent:
                                                                         xmax = iw - 1 if isinstance(iw, int) else "?"
                                                                         ymax = ih - 1 if isinstance(ih, int) else "?"
                                                                         result = (f"Screen frame sent ({iw}x{ih} image pixels). "
+                                                                                  f"This is frame #{frame_seq}: report click targets from THIS frame "
+                                                                                  f"and pass frame_seq={frame_seq} to click_screen. Older frame numbers "
+                                                                                  f"are stale and will be refused. "
                                                                                   "Report click targets in THESE image-pixel "
                                                                                   f"coordinates (0-{xmax} horizontally, 0-{ymax} vertically). "
                                                                                   "Use the dimensions stated here, not any fixed grid."
@@ -1327,6 +1492,12 @@ class GeminiDesktopAgent:
                                                         self._maybe_auto_hide(
                                                             function_call.name, result,
                                                             hide_callback)
+                                                        # Multi-step computer-use context: record
+                                                        # what executed (or failed) so dependent
+                                                        # visual actions need fresh evidence and
+                                                        # retries stay bounded.
+                                                        self._update_cu_context(
+                                                            function_call.name, result)
                                                         if function_call.name == "click_screen" and isinstance(args, dict):
                                                             # Record executed clicks for post-click
                                                             # verification: only real dispatches
@@ -1408,6 +1579,8 @@ class GeminiDesktopAgent:
                                                 import cat_talker.tools as _tools_mod
                                                 _tools_mod.set_coordinate_geometry(
                                                     getattr(self.vision, "last_capture_geometry", None))
+                                                self.cu.note_frame_sent(
+                                                    _tools_mod.get_frame_seq())
                                                 self._set_bubble(bubble_callback, "📸 Captured Active Window")
                                                 self._set_glow(glow_callback, "vision")
                                                 async with send_lock:
