@@ -1,8 +1,10 @@
 # AI Assistant — current verified project state
 
-Checkpoint: **`5ee950c`** — *Stabilize voice lifecycle and complete core
-assistant stack*. Clean working tree; everything below is implemented,
-unit-tested (374 passed via `./.venv/bin/python -m pytest -q`), and
+Checkpoint: **`ec7276f`** — *Improve desktop navigation and assistant UX*
+(follows `5ee950c` *Stabilize voice lifecycle and complete core assistant
+stack*). Working tree matches the checkpoint except untracked `.vscode/`
+(IDE state, not project source); everything below is implemented,
+unit-tested (409 passed via `./.venv/bin/python -m pytest -q`), and
 committed. No hardware, network, speakers, or credentials needed for
 the suite (fakes for Live sessions, audio, vision, Qt offscreen,
 playerctl, subprocess, network).
@@ -53,9 +55,16 @@ playerctl, subprocess, network).
   only), deterministic `read_aloud` (local espeak-ng PCM into the
   existing playback path), external coding worker (delegated execution
   in an explicitly selected workspace + independent verification),
-  sleep/wake + F1/F2/F3 control plane, media-aware auto-sleep
-  (MPRIS `Playing` edge → sleep; never wakes, never pauses media),
-  graceful shutdown, conversation history log, JSON config.
+   sleep/wake + F1/F2/F3 control plane, media-aware auto-sleep
+   (MPRIS `Playing` edge → sleep; never wakes, never pauses media),
+   Hyprland workspace switching (user-facing workspaces 1–6; numeric
+   input validated and clamped 1–10; success verified against the
+   active workspace), auto-hide avatar UI after successful
+   desktop-opening/focus actions (`open_application`, `open_website`,
+   `open_file`, `focus_or_launch`, `search_and_play_youtube`;
+   visibility-only via `UiBridge.hide()` — never sleeps, never pauses
+   media; error results and all other tools never hide),
+   graceful shutdown, conversation history log, JSON config.
 - Local date/time: `get_current_datetime` is a pure read-only tool in
   `ALL_TOOLS` and is deliberately NOT in `SIDE_EFFECT_TOOLS`. Clock,
   web-search, and weather concepts stay separate in the guidance.
@@ -84,8 +93,12 @@ playerctl, subprocess, network).
   - **The coding worker has NO OS-level sandbox.** The boundary is
     validation + cwd/`--dir` scoping + approval + verification; a
     compromised same-UID worker process could theoretically escape it.
-  - **`read_aloud` needs `espeak-ng`** for standalone speech; without
-    it, it fails honestly with install guidance.
+   - **`read_aloud` needs `espeak-ng`** for standalone speech; without
+     it, it fails honestly with install guidance.
+   - Live voice-command end-to-end for workspace 5/6 switching and the
+     auto-hide round-trip (hide → F1/`"Show yourself"` restore) is
+     real-world-pending: verified at the `hyprctl`/tool level plus
+     offscreen Qt tests, awaiting a spoken acceptance pass.
   - Weather needs network (Open-Meteo, no key); web search/fetch are
     bounded best-effort (single DuckDuckGo Lite provider; UNTRUSTED
     DATA discipline); English/Hindi responses only.

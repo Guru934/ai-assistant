@@ -42,9 +42,10 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Settings Persistence** - API key, preferred monitor, auto-reconnect, voice approval saved to `~/.config/cat-talker/config.json`
 - **Modular Design** - Cleanly separated audio, vision, config, logging, and AI modules
 - **Structured Logging** - All modules use structured logging (DEBUG/INFO/WARNING/ERROR)
-- **Unit Tests** - 374 tests covering lifecycle, audio, sleep/wake,
+- **Unit Tests** - 409 tests covering lifecycle, audio, sleep/wake,
   control/launch, vision, tools, web info, Weather, Memory, TTS, coding
-  worker + verification, diagnostics (see "Test Results" below)
+  worker + verification, workspace switching (1–6), auto-hide
+  visibility, diagnostics (see "Test Results" below)
 
 ### ✅ OS Tools (Auto-Execute - No Approval)
 | Tool | Description |
@@ -61,7 +62,7 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 | `take_screenshot(name, monitor?)` | Captures specific monitor or full desktop via `grim`/`mss` to `~/Pictures/Screenshots` |
 | `inspect_screen(query, monitor?)` | On-demand vision - captures frame and sends to Gemini for analysis |
 | `focus_or_launch(app)` | Focus existing window or launch app (Hyprland) |
-| `switch_workspace(num)` | Switch Hyprland workspace (1-10) |
+| `switch_workspace(num)` | Switch Hyprland workspace (user-facing 1–6; input validated/clamped 1–10, success verified) |
 | `media_action(cmd)` | Control media via `playerctl` (play, pause, next, previous, status, metadata) |
 | `set_clipboard(text)` | Set system clipboard via `wl-copy` |
 | `send_notification(title, body)` | Desktop notification via `notify-send` |
@@ -99,6 +100,9 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Transcript safety guard** + audio/transcript diagnostics
 - **External coding worker** (delegated execution + independent
   verification; worker claims ≠ verified facts)
+- **Workspace switching** (user-facing 1–6) + **auto-hide avatar UI**
+  after successful desktop-opening/focus actions (visibility-only;
+  never sleeps)
 
 ## Project Structure
 ```
@@ -163,7 +167,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 ## Test Results
 ```bash
 ./.venv/bin/python -m pytest -q
-# 374 passed — no hardware, network, speakers, or credentials needed
+# 409 passed — no hardware, network, speakers, or credentials needed
 # (fakes for Live sessions, audio, vision, Qt offscreen, playerctl,
 # subprocess, network). See README "How to run tests" for coverage.
 ```
@@ -197,7 +201,10 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ---
 
-*Last verified: 2026-10-05 at checkpoint `5ee950c` (374 tests passing).
+*Last verified: 2026-10-05 at checkpoint `ec7276f` (409 tests passing).
+Live voice-command end-to-end for workspace 5/6 and the auto-hide
+round-trip is real-world-pending (verified at `hyprctl`/tool level +
+offscreen Qt tests).
 Historical note (2026-09-23 session): Cat Talker v2.0 brought
 multi-monitor vision, settings persistence, logging, early bug fixes —
 all of the above supersedes that snapshot.*

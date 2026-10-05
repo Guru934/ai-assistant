@@ -1,4 +1,4 @@
-Completed (all implemented and committed as of `5ee950c`)
+Completed (all implemented and committed as of `ec7276f`, follows `5ee950c`)
 ├── Core voice assistant
 ├── Gemini Live lifecycle
 ├── OS controls
@@ -19,10 +19,15 @@ Completed (all implemented and committed as of `5ee950c`)
 ├── Voice path (512-frame chunks, explicit VAD, en-IN/hi-IN hints)
 ├── Media-aware auto-sleep
 ├── External coding worker + independent verification
-└── Audio/transcript diagnostics + echo staging bound
+├── Audio/transcript diagnostics + echo staging bound
+├── Hyprland workspace switching (user-facing 1–6, verified)
+└── Auto-hide avatar UI after successful desktop-opening actions
+    (visibility-only; never sleeps)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── End-to-end acceptance testing (live mic across wake cycles)
+├── Spoken acceptance: workspace 5/6 switching + auto-hide round-trip
+└── (hide → F1 restore; workspace change must not hide)
 ├── Documentation maintenance
 ├── UX/polish based on real usage
 ├── Remaining audio/echo edge cases

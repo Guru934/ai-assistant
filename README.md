@@ -190,14 +190,15 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-374 passed, no hardware or network needed (fakes for Live sessions,
+409 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
 computer-use grounding, echo DSP, sleep/wake + F1/F2/F3 control,
 single-instance launch, window lifecycle, shutdown, voice config
 (VAD/hints/guard), media watcher, web info, Weather, Memory, TTS,
-coding worker + verification, diagnostics, and packaging.
+coding worker + verification, workspace switching (user-facing 1–6),
+auto-hide visibility behavior, diagnostics, and packaging.
 
-Current state: checkpoint `5ee950c`, all green; next phase is product
+Current state: checkpoint `ec7276f`, all green; next phase is product
 acceptance and real-world validation (see `ROADMAP.md`). No `AGENTS.md`
 exists in this repo; engineering rules live with the maintainer.
