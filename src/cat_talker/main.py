@@ -27,6 +27,18 @@ COLORS = {
     "bubble_text": QColor(240, 240, 245),
 }
 
+# Speech-bubble text zone: full-width box at the top of the window,
+# wrapping inside these bounds (never clipped, never overlapping).
+BUBBLE_TEXT_MAX_W = 268
+BUBBLE_TEXT_MAX_H = 112
+BUBBLE_PAD_X = 14
+BUBBLE_PAD_Y = 10
+BUBBLE_TOP = 8
+# Avatar re-layout while the bubble shows: shift down + shrink so the
+# bubble zone and the avatar never overlap. Identity when hidden.
+BUBBLE_AVATAR_CY = 222
+BUBBLE_AVATAR_SCALE = 0.85
+
 class SettingsDialog(QDialog):
     """Chibi settings over the existing config/memory boundaries.
 
@@ -211,6 +223,7 @@ class RadialVisualizerWindow(QWidget):
         self.current_state = "idle"
         self.bubble_text = ""
         self._bubble_opacity = 0.0
+        self._bubble_gen = 0
         self.glow_state = "connected"
         self.hue_phase = 0.0
 
@@ -238,22 +251,13 @@ class RadialVisualizerWindow(QWidget):
         self.vis_widget.setStyleSheet("background: transparent;")
         layout.addWidget(self.vis_widget, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # ── Speech Bubble (separate widget overlay) ────────────────
-        self.bubble_label = QLabel("", self)
-        self.bubble_label.setWordWrap(True)
-        self.bubble_label.setStyleSheet(f"""
-            QLabel {{
-                color: {COLORS["bubble_text"].name()};
-                background-color: {COLORS["bubble_bg"].name()};
-                border-radius: 12px;
-                padding: 8px 12px;
-                font-family: 'Outfit', 'Work Sans', sans-serif;
-                font-size: 13px;
-                font-weight: 400;
-            }}
-        """)
-        self.bubble_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.bubble_label.hide()
+        # ── Speech Bubble (painted in-window) ────────────────────────
+        # A child widget or separate window above the avatar gets clipped
+        # (negative y inside the 320x320 parent) or mismanaged by the
+        # compositor. Painting the bubble directly in paintEvent keeps it
+        # always inside the renderable window: no second window, no
+        # positioning fights, transparency and fade behavior unchanged.
+        self._bubble_visible = False
 
         self.bubble_anim = QPropertyAnimation(self, b"bubble_opacity")
         self.bubble_anim.setDuration(400)
@@ -280,11 +284,7 @@ class RadialVisualizerWindow(QWidget):
 
     def _set_bubble_opacity(self, val):
         self._bubble_opacity = val
-        self.bubble_label.setWindowOpacity(val)
-        if val > 0.01:
-            self.bubble_label.show()
-        else:
-            self.bubble_label.hide()
+        self._bubble_visible = val > 0.01
 
     bubble_opacity = pyqtProperty(float, _get_bubble_opacity, _set_bubble_opacity)
 
@@ -363,16 +363,26 @@ class RadialVisualizerWindow(QWidget):
 
     def _on_bubble(self, text: str):
         self.bubble_text = text
-        self._position_bubble()
-        self.bubble_label.setText(text)
-        self.bubble_label.adjustSize()
+        self._bubble_gen += 1
+        gen = self._bubble_gen
         self.bubble_anim.stop()
         self.bubble_anim.setStartValue(0.0)
         self.bubble_anim.setEndValue(1.0)
         self.bubble_anim.start()
-        QTimer.singleShot(3000, self._fade_bubble)
+        QTimer.singleShot(
+            3000, lambda gen=gen: self._fade_bubble(gen))
 
-    def _fade_bubble(self):
+    def bubble_rect(self):
+        """Bubble background box in window coords (for paint and tests).
+
+        Kept for compatibility; identical to _bubble_box()."""
+        return self._bubble_box()
+
+    def _fade_bubble(self, gen=None):
+        # Generation-guarded: a timer armed by an older message must never
+        # fade a newer one (also makes overlapping bubbles deterministic).
+        if gen is not None and gen != self._bubble_gen:
+            return
         if self._bubble_opacity > 0.01:
             self.bubble_anim.stop()
             self.bubble_anim.setStartValue(self._bubble_opacity)
@@ -382,22 +392,79 @@ class RadialVisualizerWindow(QWidget):
     def _on_glow(self, state: str):
         self.glow_state = state
 
-    def _position_bubble(self):
-        pos = self.vis_widget.pos()
-        bubble_w = self.bubble_label.sizeHint().width()
-        bubble_h = self.bubble_label.sizeHint().height()
-        x = pos.x() + (self.vis_widget.width() - bubble_w) // 2
-        y = pos.y() - bubble_h - 10
-        self.bubble_label.move(x, y)
+    def _bubble_font(self):
+        font = QFont("Outfit", 15)
+        return font
+
+    def _bubble_box(self):
+        """Bubble background box in window coords, from current text.
+
+        Always fully inside the window: full width with side margins,
+        text wrapped and capped so the box ends well above the avatar
+        zone. Returns (x, y, w, h). Empty text gives a zero box.
+        """
+        from PyQt6.QtGui import QFontMetrics
+        if not self.bubble_text:
+            return (0, 0, 0, 0)
+        metrics = QFontMetrics(self._bubble_font())
+        inner = metrics.boundingRect(
+            0, 0, BUBBLE_TEXT_MAX_W, 10000,
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+            self.bubble_text)
+        text_h = min(inner.height(), BUBBLE_TEXT_MAX_H)
+        box_w = BUBBLE_TEXT_MAX_W + BUBBLE_PAD_X * 2
+        box_h = text_h + BUBBLE_PAD_Y * 2
+        box_x = (self.width() - box_w) // 2
+        return (box_x, BUBBLE_TOP, box_w, box_h)
+
+    def _paint_bubble(self, painter):
+        """Draw the speech bubble box + wrapped text (window coords).
+
+        Lives entirely inside the 320x320 window above the (shifted)
+        avatar: rounded semi-opaque background for contrast over any
+        wallpaper, 15px light text, fade opacity applied to both.
+        """
+        from PyQt6.QtCore import QRect
+        box_x, box_y, box_w, box_h = self._bubble_box()
+        if box_w <= 0 or box_h <= 0:
+            return
+        painter.save()
+        painter.setOpacity(self._bubble_opacity)
+        painter.setBrush(COLORS["bubble_bg"])
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(box_x, box_y, box_w, box_h, 12, 12)
+        painter.setPen(COLORS["bubble_text"])
+        painter.setFont(self._bubble_font())
+        text_rect = QRect(box_x + BUBBLE_PAD_X,
+                          box_y + BUBBLE_PAD_Y,
+                          box_w - BUBBLE_PAD_X * 2,
+                          box_h - BUBBLE_PAD_Y * 2)
+        painter.drawText(text_rect,
+                         Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                         self.bubble_text)
+        painter.restore()
 
     # ─── Painting ─────────────────────────────────────────────────
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        bubble_on = bool(self._bubble_visible and self.bubble_text)
+        if bubble_on:
+            self._paint_bubble(painter)
+
         painter.translate(self.vis_widget.pos())
 
         center_x = self.vis_widget.width() / 2
         center_y = self.vis_widget.height() / 2
+
+        if bubble_on:
+            # Make room: shift the avatar block down and shrink it so the
+            # bubble zone above never overlaps the avatar. Identity when
+            # the bubble is hidden (existing look untouched).
+            painter.translate(150, BUBBLE_AVATAR_CY)
+            painter.scale(BUBBLE_AVATAR_SCALE, BUBBLE_AVATAR_SCALE)
+            painter.translate(-150, -150)
         
         # Scale everything inside the visualizer widget by the bass if talking
         bass = self.bass_scale if self.current_state == 'talking' else 1.0
@@ -860,6 +927,12 @@ def main():
     # started when one answers; the socket file is this instance's ID.
     def _get_agent():
         return global_agent[0] if global_agent else None
+
+    # System tray: same process, same window, same control semantics
+    # (F1/F2/F3). Falls back silently where no tray host exists.
+    from cat_talker.tray import ChibiTray
+    tray = ChibiTray(_get_agent, ui_bridge, window)
+    tray.start()
 
     # Single-instance gate: if another live assistant owns the control
     # socket, this process must NOT continue headless (a second live
