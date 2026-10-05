@@ -41,6 +41,10 @@ WORKER_TIMEOUT_DEFAULT = 300
 WORKER_TIMEOUT_MAX = 900
 OUTPUT_MAX_BYTES = 32 * 1024
 TRUNCATION_NOTE = "\n...[TRUNCATED]"
+# Independent-verification output kept for the voice report: concise and
+# bounded separately from the worker's own (potentially large) output.
+VERIFY_SUMMARY_MAX_CHARS = 2000
+VERIFY_TRUNCATION_NOTE = "\n...[verification output truncated]"
 
 # First CLI wrapped. Overridable without code changes via
 # CAT_TALKER_CODER_BIN (bare binary name or absolute path; it becomes
@@ -152,44 +156,70 @@ class WorkerResult:
     # One of: not_run, worker_reported_pass, worker_reported_fail,
     # independently_verified_pass, independently_verified_fail, unknown.
     verification: str = "not_run"
+    # Actual validated workspace path the work ran in (realpath, set by
+    # the provider/verify stages - never an unvalidated user string).
+    workspace: str = ""
+    # Independent verification command outcome: exit status (None when no
+    # command ran) and bounded output, kept separate from worker output.
+    verify_exit: object = None  # int / None (no command ran)
+    verify_output: str = ""
 
     def render(self) -> str:
-        """Human-readable report. Only independent verification may be
+        """Stable compact report: claim, verified fact, and unknown stay
+        in separate labeled fields. Only independent verification may be
         worded as verified fact; everything else is an explicit claim
         or an explicit absence of verification. Failure never claims
-        completion."""
+        completion, and partial results (files changed but verification
+        failed, truncated output, missing verification) stay visible."""
+        lines = []
+        if self.workspace:
+            workspace_line = f"Workspace: {self.workspace}"
+        else:
+            workspace_line = ""
         if not self.ok:
-            lines = ["Coding task FAILED."]
+            lines.append("Coding task FAILED.")
+            if workspace_line:
+                lines.append(workspace_line)
             if self.error:
-                lines.append(f"Error: {self.error}")
+                lines.append(f"Reason: {self.error}")
             elif self.summary:
                 lines.append(f"Detail: {self.summary}")
+            lines.extend(_files_block(self.files_changed))
+            lines.append(f"Verification: {self.verification}")
+            if self.truncated:
+                lines.append("(Worker output was truncated.)")
             return "\n".join(lines)
         if self.verification == "independently_verified_pass":
-            lines = ["Coding task succeeded (independently verified): "
-                     + (self.summary or "done.")]
+            lines.append("Coding task succeeded.")
         elif self.verification == "independently_verified_fail":
-            lines = ["Worker completed; "
-                     "independent verification FAILED."]
-            if self.summary:
-                lines.append(f"Worker reports: {self.summary}")
+            lines.append("Worker completed; independent verification FAILED.")
         else:
-            lines = ["Worker completed; verification was not available."]
-            if self.summary:
+            lines.append("Worker completed; verification was not available.")
+        if workspace_line:
+            lines.append(workspace_line)
+        lines.append(f"Verification: {self.verification}")
+        if self.summary:
+            if self.verification == "independently_verified_pass":
+                lines.append(f"Summary: {self.summary}")
+            else:
                 lines.append(f"Worker reports: {self.summary}")
-        if self.files_changed:
-            lines.append("Files changed: "
-                         + ", ".join(self.files_changed))
+        lines.extend(_files_block(self.files_changed))
         if self.commands:
-            shown = "; ".join(self.commands[:5])
+            shown = "; ".join(str(c) for c in self.commands[:5])
             lines.append(f"Commands run: {shown}")
-        if self.verification == "independently_verified_fail":
-            lines.append("Independent verification: FAILED.")
+        if self.verify_output or isinstance(self.verify_exit, int):
+            lines.append(_verify_block(self.verify_exit, self.verify_output))
+        if self.verification == "independently_verified_pass":
+            lines.append("Tests: independently verified.")
         elif self.tests_passed is True:
-            lines.append("Tests: worker reports tests passed "
+            lines.append("Worker tests: reported pass "
                          "(NOT independently verified).")
         elif self.tests_passed is False:
-            lines.append("Tests: worker reports tests FAILED.")
+            lines.append("Worker tests: reported FAILED.")
+        else:
+            lines.append("Worker tests: unknown (NOT independently verified).")
+        if self.error and self.verification != "independently_verified_pass":
+            lines.append(f"Reason: {self.error}")
         if self.truncated:
             lines.append("(Worker output was truncated.)")
         return "\n".join(lines)
@@ -203,6 +233,40 @@ def _clip(text: str) -> tuple:
         return text, False
     raw = text.encode("utf-8", errors="replace")[:OUTPUT_MAX_BYTES]
     return raw.decode("utf-8", errors="replace") + TRUNCATION_NOTE, True
+
+
+def _files_block(files_changed) -> list:
+    """Render the file list as a labeled bullet block (empty when none)."""
+    files = [f for f in (files_changed or []) if isinstance(f, str) and f]
+    if not files:
+        return []
+    return (["Files changed:"]
+            + [f"* {f}" for f in files[:20]])
+
+
+def _verify_summary(out_text: str, err_text: str) -> tuple:
+    """Concise bounded verification output, stdout preferred.
+
+    Returns (text, was_cut). Test-runner output normally lands on stdout;
+    stderr is the fallback so diagnostics are never silently dropped.
+    """
+    text = out_text if isinstance(out_text, str) and out_text.strip() \
+        else (err_text or "")
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= VERIFY_SUMMARY_MAX_CHARS:
+        return text, False
+    return (text[:VERIFY_SUMMARY_MAX_CHARS] + VERIFY_TRUNCATION_NOTE, True)
+
+
+def _verify_block(verify_exit, verify_output: str) -> str:
+    """Labeled verification-output block for render()."""
+    if isinstance(verify_exit, int):
+        head = f"Verification output (exit {verify_exit}):"
+    else:
+        head = "Verification output:"
+    body = verify_output if isinstance(verify_output, str) else ""
+    return head + (("\n" + body) if body else " (none)")
 
 
 def _claim_state(tests) -> str:
@@ -257,25 +321,29 @@ def result_from_process(returncode: int, stdout: str, stderr: str,
                 return WorkerResult(ok=True, summary=summary + note,
                                     files_changed=files, commands=commands,
                                     tests_passed=tests, truncated=truncated,
-                                    verification=_claim_state(tests))
+                                    verification=_claim_state(tests),
+                                    workspace=workspace)
             return WorkerResult(
                 ok=False, summary=summary + note, files_changed=files,
                 commands=commands, tests_passed=False,
                 error=(str(envelope.get("error", ""))[:1000]
                        or f"worker exited with code {returncode}"),
                 truncated=truncated,
-                verification=_claim_state(False))
+                verification=_claim_state(False),
+                workspace=workspace)
         clipped, _ = _clip(stdout or "")
         err_clipped, _ = _clip(stderr or "")
         if returncode == 0:
             return WorkerResult(ok=True, summary=clipped or "done.",
                                 truncated=truncated,
-                                verification="unknown")
+                                verification="unknown",
+                                workspace=workspace)
         return WorkerResult(
             ok=False, summary=clipped,
             error=err_clipped or f"worker exited with code {returncode}",
             truncated=truncated,
-            verification="unknown")
+            verification="unknown",
+            workspace=workspace)
     except Exception as e:
         return WorkerResult(ok=False,
                             error=f"Worker result handling failed: {e}",
@@ -330,8 +398,13 @@ def verify_result(request: WorkerRequest, result: WorkerResult) -> WorkerResult:
             except Exception:
                 pass
             result.verification = "unknown"
+            result.verify_exit = None
+            result.verify_output = ""
             result.error = "Verification timed out."
             return result
+        summary, _ = _verify_summary(out_text or "", err_text or "")
+        result.verify_exit = proc.returncode
+        result.verify_output = summary
         if passed:
             result.verification = "independently_verified_pass"
         else:
@@ -389,7 +462,8 @@ class SubprocessWorkerProvider(WorkerProvider):
             return WorkerResult(
                 ok=False,
                 error=f"Coding worker not installed: '{self.binary}' "
-                      f"not found on PATH.")
+                      f"not found on PATH.",
+                workspace=req.workspace)
         prompt = req.task
         if req.constraints:
             prompt += "\nConstraints: " + req.constraints
@@ -420,7 +494,8 @@ class SubprocessWorkerProvider(WorkerProvider):
                 pass
             return WorkerResult(
                 ok=False,
-                error=f"Coding worker timed out after {timeout}s; stopped.")
+                error=f"Coding worker timed out after {timeout}s; stopped.",
+                workspace=req.workspace)
         except Exception as e:
             _kill_process_group(proc)
             return WorkerResult(ok=False, error=f"Coding worker failed: {e}")
@@ -449,7 +524,7 @@ def get_default_provider() -> WorkerProvider:
     return _DEFAULT_PROVIDER
 
 
-def delegate(request: WorkerRequest,
+def delegate(request: WorkerRequest | dict,
              provider: WorkerProvider | None = None) -> str:
     """Validate, execute via provider, verify, render. Never raises."""
     try:

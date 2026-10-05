@@ -522,3 +522,165 @@ def test_real_subprocess_provider_end_to_end(tmp_path):
     stray = [p for p in tmp_path.iterdir()
              if p.name not in ("fakecli", "made.txt")]
     assert stray == [], stray
+
+
+# ─── structured trustworthy reporting ─────────────────────────────
+
+def test_verified_pass_report_has_all_fields(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    (tmp_path / "foo.py").write_text("x = 1\n")
+    req = build_request(ws, "t",
+                        verify_command=[sys.executable, "-c",
+                                        "print('3 passed')"])
+    result = cw.verify_result(
+        req, WorkerResult(ok=True, summary="Added foo.",
+                          files_changed=["foo.py"],
+                          commands=["pytest -q"],
+                          tests_passed=True,
+                          verification="worker_reported_pass",
+                          workspace=ws))
+    assert result.verification == "independently_verified_pass"
+    assert result.verify_exit == 0
+    assert "3 passed" in result.verify_output
+    rendered = result.render()
+    assert rendered.startswith("Coding task succeeded.")
+    assert f"Workspace: {ws}" in rendered
+    assert "Verification: independently_verified_pass" in rendered
+    assert "Summary: Added foo." in rendered
+    assert "* foo.py" in rendered
+    assert "Commands run: pytest -q" in rendered
+    assert "Verification output (exit 0):" in rendered
+    assert "3 passed" in rendered
+    assert "Tests: independently verified." in rendered
+    assert "NOT independently verified" not in rendered
+
+
+def test_worker_success_without_verification(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    (tmp_path / "a.py").write_text("x = 1\n")
+    req = build_request(ws, "t")  # no verify_command
+    result = cw.verify_result(
+        req, WorkerResult(ok=True, summary="Did it.",
+                          files_changed=["a.py"], tests_passed=True,
+                          verification="worker_reported_pass",
+                          workspace=ws))
+    assert result.verification == "worker_reported_pass"
+    assert result.verify_exit is None
+    rendered = result.render()
+    assert "Worker completed; verification was not available." in rendered
+    assert f"Workspace: {ws}" in rendered
+    assert "Verification: worker_reported_pass" in rendered
+    assert "Worker tests: reported pass (NOT independently verified)." \
+        in rendered
+
+
+def test_claim_fail_wording_stays_claim(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    result = WorkerResult(ok=True, summary="s", tests_passed=False,
+                          verification="worker_reported_fail",
+                          workspace=ws)
+    rendered = result.render()
+    assert "Worker tests: reported FAILED." in rendered
+    assert "independently verified pass" not in rendered
+    assert "All tests passed" not in rendered
+
+
+def test_partial_files_with_failed_verification(tmp_path):
+    """Worker changed files but verification failed: both stay visible,
+    success is never claimed."""
+    ws = os.path.realpath(str(tmp_path))
+    (tmp_path / "foo.py").write_text("x = 1\n")
+    req = build_request(ws, "t",
+                        verify_command=[sys.executable, "-c",
+                                        "import sys; sys.exit(2)"])
+    result = cw.verify_result(
+        req, WorkerResult(ok=True, summary="Changed foo.",
+                          files_changed=["foo.py"], tests_passed=True,
+                          verification="worker_reported_pass",
+                          workspace=ws))
+    assert result.verification == "independently_verified_fail"
+    assert result.verify_exit == 2
+    rendered = result.render()
+    assert "independent verification FAILED" in rendered
+    assert "* foo.py" in rendered
+    assert "Verification: independently_verified_fail" in rendered
+    assert "succeeded" not in rendered.lower()
+
+
+def test_verify_command_missing_is_unknown(tmp_path, monkeypatch):
+    ws = os.path.realpath(str(tmp_path))
+    req = build_request(ws, "t",
+                        verify_command=["definitely-not-a-real-binary-xyz"])
+    result = cw.verify_result(
+        req, WorkerResult(ok=True, summary="s", workspace=ws,
+                          verification="worker_reported_pass"))
+    assert result.verification == "unknown"
+    assert "could not run" in result.error
+    rendered = result.render()
+    assert "verification was not available" in rendered
+    assert f"Workspace: {ws}" in rendered
+
+
+def test_verify_timeout_is_unknown(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    req = build_request(ws, "t", timeout=1,
+                        verify_command=[sys.executable, "-c",
+                                        "import time; time.sleep(30)"])
+    result = cw.verify_result(
+        req, WorkerResult(ok=True, summary="s", workspace=ws))
+    assert result.verification == "unknown"
+    assert "timed out" in result.error
+    assert "succeeded" not in result.render().lower()
+
+
+def test_verify_output_bounded(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    big = "x" * (cw.VERIFY_SUMMARY_MAX_CHARS + 500)
+    req = build_request(ws, "t",
+                        verify_command=[sys.executable, "-c",
+                                        f"print({big!r})"])
+    result = cw.verify_result(
+        req, WorkerResult(ok=True, summary="s", workspace=ws))
+    assert result.verification == "independently_verified_pass"
+    assert len(result.verify_output) <= cw.VERIFY_SUMMARY_MAX_CHARS + 100
+    assert "truncated" in result.render()
+
+
+def test_rejected_workspace_never_reported_as_validated(tmp_path):
+    out = delegate({"workspace": "/no/such/dir-xyz", "task": "t"})
+    assert "Workspace:" not in out
+    assert "not a directory" in out
+
+
+def test_failure_report_has_workspace_and_reason(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    result = WorkerResult(ok=False, error="boom exploded",
+                          files_changed=["half.py"], workspace=ws,
+                          verification="unknown")
+    rendered = result.render()
+    assert rendered.startswith("Coding task FAILED.")
+    assert f"Workspace: {ws}" in rendered
+    assert "Reason: boom exploded" in rendered
+    assert "* half.py" in rendered
+    assert "Verification: unknown" in rendered
+    assert "succeed" not in rendered.lower()
+
+
+def test_reported_test_failure_without_verification(tmp_path):
+    ws = os.path.realpath(str(tmp_path))
+    result = result_from_process(
+        0, json.dumps({"summary": "tried", "tests_passed": False,
+                       "files_changed": []}), "", False, ws)
+    assert result.verification == "worker_reported_fail"
+    rendered = result.render()
+    assert "Worker tests: reported FAILED." in rendered
+    assert "verification was not available" in rendered
+
+
+def test_approval_still_gates_coding_task(tmp_path, _clean_pending,
+                                          monkeypatch):
+    from cat_talker.tools import run_coding_task
+    ws = os.path.realpath(str(tmp_path))
+    paused = run_coding_task("add a file", ws)
+    assert "PAUSED FOR SAFETY" in paused
+    assert "Do you confirm" in paused
