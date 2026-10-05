@@ -74,9 +74,16 @@ def test_vad_sensitivities_are_sdk_enums():
 
 
 def test_live_config_keeps_audio_modality_and_tools():
+    from google.genai import types
     config = build_live_config("instructions")
-    assert config.response_modalities == ["AUDIO"]
+    mods = config.response_modalities
+    assert mods is not None
+    assert types.Modality.AUDIO in mods
+    assert types.Modality.TEXT in mods
+    # Audio path untouched: audio still streams for playback.
+    assert len(mods) == 2
     # The SDK copies the tool list; elements are the same callables.
+    assert config.tools is not None
     assert list(config.tools) == list(ALL_TOOLS)
 
 

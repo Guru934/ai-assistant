@@ -172,6 +172,53 @@ class ComputerUseContext:
         """True when the next visual step needs a fresh screenshot first."""
         return self.verification_pending or self.click_requires_fresh_frame()
 
+
+class ResponseTextAccumulator:
+    """Assemble one assistant text response from streaming Live deltas.
+
+    The Live API may deliver a response as several model_turn text parts
+    that are incremental chunks, cumulative resends, or exact duplicates.
+    add() returns only the genuinely NEW portion ("" when nothing new),
+    so the UI never shows duplicated text. complete() returns the full
+    response and resets for the next turn. Pure state machine: no agent
+    state, no callbacks, unit-testable. Never invents text: non-string
+    or empty parts are ignored (and logged by the caller).
+    """
+
+    def __init__(self):
+        self._buf = ""
+
+    @property
+    def current(self) -> str:
+        return self._buf
+
+    def add(self, text) -> str:
+        """Fold one text part in; return the new portion to display."""
+        if not isinstance(text, str) or not text:
+            return ""
+        buf = self._buf
+        if not buf:
+            self._buf = text
+            return text
+        if text == buf or buf.endswith(text):
+            return ""  # exact or tail duplicate
+        if text.startswith(buf):
+            self._buf = text  # cumulative resend
+            return text[len(buf):]
+        # Suffix/prefix overlap join: longest suffix of buf that opens text.
+        overlap = 0
+        for k in range(min(len(buf), len(text)), 0, -1):
+            if buf.endswith(text[:k]):
+                overlap = k
+                break
+        self._buf = buf + text[overlap:]
+        return text[overlap:]
+
+    def complete(self) -> str:
+        """Return the assembled response and reset."""
+        out, self._buf = self._buf, ""
+        return out
+
 # Short explicit confirmations that are always actionable as turns.
 _ACTIONABLE_SHORT = frozenset({"yes", "no", "stop", "cancel"})
 
@@ -331,9 +378,13 @@ def build_live_config(system_instructions: str):
       700 ms end silence avoids cutting sentences early;
     - input transcription stays VERBATIM (mode unset = SDK default) with
       explicit ["en-IN", "hi-IN"] hints for Indian English/Hindi/Hinglish.
+    - response modalities are AUDIO (existing playback path, untouched)
+      plus TEXT: assistant text arrives as model_turn text parts, is
+      assembled by ResponseTextAccumulator, streamed to the UI bubble,
+      and written to history once per completed response.
     """
     return types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
+        response_modalities=[types.Modality.AUDIO, types.Modality.TEXT],
         system_instruction=types.Content(
             parts=[types.Part(text=system_instructions)]),
         output_audio_transcription=types.AudioTranscriptionConfig(
@@ -396,6 +447,10 @@ class GeminiDesktopAgent:
         # Multi-step computer-use execution context: newest sent frame,
         # last executed action, pending verification, failure budget.
         self.cu = ComputerUseContext()
+        # Assistant TEXT response assembly (AUDIO path untouched): deltas
+        # accumulate here per model turn, flush to UI/history on
+        # turn_complete (or interruption).
+        self._response_text = ResponseTextAccumulator()
         # Web fetch budget: fetch_webpage calls used in the current user
         # interaction (resets whenever a new user turn starts, alongside
         # _interaction_id / seen_signatures). Per-turn, not lifetime.
@@ -487,6 +542,32 @@ class GeminiDesktopAgent:
                 self.cu.note_executed(tool_name)
             else:
                 self.cu.note_failure()
+
+    def _handle_model_text(self, part, text_callback):
+        """Fold one model_turn text part into the response buffer.
+
+        Genuinely new text streams to the UI bubble via the "model_delta"
+        role (live display only, no history write). The completed response
+        is flushed once as role "model" on turn_complete/interruption.
+        Malformed parts are logged and ignored; the audio path is never
+        affected, and text is never invented.
+        """
+        text = getattr(part, "text", None)
+        if not text:
+            return
+        if not isinstance(text, str):
+            logger.warning("response text: ignoring non-string part.text "
+                           "of type %s", type(text).__name__)
+            return
+        portion = self._response_text.add(text)
+        if portion and text_callback:
+            text_callback("model_delta", self._response_text.current)
+
+    def _flush_response_text(self, text_callback):
+        """Emit the assembled assistant response (role "model") once."""
+        full = self._response_text.complete()
+        if full and text_callback:
+            text_callback("model", full)
 
     def _start_new_interaction(self, seen_signatures=None):
         """Begin a new user interaction: reset per-turn budgets.
@@ -1060,6 +1141,9 @@ class GeminiDesktopAgent:
                                                 self._set_state(state_callback, "listening")
                                                 import cat_talker.tools
                                                 cat_talker.tools.stop_media_ducking()
+                                                # Cut off mid-response: flush whatever text
+                                                # was assembled so the UI matches the audio.
+                                                self._flush_response_text(text_callback)
                                                 # Model cut off: output already
                                                 # cleared, so drain is instant;
                                                 # cooldown still applies.
@@ -1083,6 +1167,9 @@ class GeminiDesktopAgent:
                                                 self.sleep.confirm_voice_if_engaged(
                                                     self._model_spoke)
                                                 self._model_spoke = False
+                                                # Response finished: flush the assembled
+                                                # assistant text once (history + UI).
+                                                self._flush_response_text(text_callback)
                                                 # F2 pressed mid-response: sleep now
                                                 # that the turn is over.
                                                 if self.sleep.take_pending_sleep():
@@ -1191,10 +1278,14 @@ class GeminiDesktopAgent:
                                                         self._set_state(state_callback, "talking")
                                                         self._set_glow(glow_callback, "connected")
                                                         self.audio.queue_output(part.inline_data.data)
-                                                    if hasattr(part, "text") and part.text and text_callback:
-                                                        text_callback("model", part.text)
-                                                        # Also show in bubble
-                                                        self._set_bubble(bubble_callback, part.text)
+                                                    # Assistant TEXT delta: assembled and
+                                                    # streamed to the UI bubble; the full
+                                                    # response flushes on turn_complete.
+                                                    # output_transcription events (audio
+                                                    # transcript of the same content) are
+                                                    # deliberately NOT consumed here, so
+                                                    # text is never duplicated.
+                                                    self._handle_model_text(part, text_callback)
 
                                         if hasattr(msg, "client_content") and msg.client_content:
                                             for turn in getattr(msg.client_content, "turns", []):

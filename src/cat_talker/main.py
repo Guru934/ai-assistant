@@ -197,6 +197,12 @@ class RadialVisualizerWindow(QWidget):
             self.target_freq_bins = bins
 
     def _on_text(self, role: str, text: str):
+        if role == "model_delta":
+            # Streaming assistant text: live bubble display only, never
+            # history (the completed "model" response is logged once).
+            if text.strip():
+                self._on_bubble(text)
+            return
         if not text.strip():
             return
         try:
