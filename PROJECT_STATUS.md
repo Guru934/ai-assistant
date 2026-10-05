@@ -1,69 +1,95 @@
 # AI Assistant — current verified project state
 
-Checkpoint: committed working tree at `000d7a3` (Add local date and time
-tool) plus UNCOMMITTED current-web-information work described below;
-see `git status` (modified: src/cat_talker/tools.py,
-src/cat_talker/agent.py, README.md, PROJECT_STATUS.md; new:
-src/cat_talker/web_search.py, src/cat_talker/webpage.py,
-tests/test_web_info.py; untracked pre-existing .vscode/).
+Checkpoint: **`5ee950c`** — *Stabilize voice lifecycle and complete core
+assistant stack*. Clean working tree; everything below is implemented,
+unit-tested (374 passed via `./.venv/bin/python -m pytest -q`), and
+committed. No hardware, network, speakers, or credentials needed for
+the suite (fakes for Live sessions, audio, vision, Qt offscreen,
+playerctl, subprocess, network).
 
-- Tests: **200 passed** (`PYTHONPATH=src .venv/bin/python -m pytest -q`:
-  154 baseline + 46 new mocked web-info tests), no hardware or network
-  required.
 - Sleep/wake implemented: startup SLEEPING, F2 toggle with busy
   deferral, 60 s meaningful-idle timeout, greeting-once, no reconnect
   while sleeping, mic capture paused while sleeping.
-- F1/F2/F4 architecture: `bin/assistant-control` over a Unix control
+- F1/F2/F3 control model: `bin/assistant-control` over a Unix control
   socket (`$XDG_RUNTIME_DIR/cat-talker/control.sock`); F1 = visibility
-  only, F2 = sleep/wake only, F4 = graceful quit. No Python hotkeys.
-- Single-instance IPC: dial-first, lock-guarded single launch, stale
-  socket handling; no killall/pkill.
+  only, F2 = sleep/wake only, F3 = graceful quit. No Python hotkeys.
+- Single-instance launch hardening: dial-first, lock-guarded single
+  launch, stale-socket handling, plus exclusive runtime-dir lock held
+  for the server's lifetime and a launcher that passes the held lock
+  fd to its child — a second process can never run headless beside the
+  first (previously caused duplicate microphone pipelines). No
+  killall/pkill.
+- Single mic-worker ownership: one capture worker per live Gemini
+  session (START/EXIT accounting with per-generation ids, peak-concurrency
+  tracking, pre-creation guard kills leftovers); old generations cannot
+  feed audio (generation gate + stale-input flush).
+- Serialized microphone stream recreation: watchdog recreates a dead
+  input stream under lock exactly once (stop → close → open), with
+  stream ids in the logs; no parallel input streams.
 - Single-window invariant: one `RadialVisualizerWindow` per process via
   a singleton factory; hide/show/flag changes reuse it; control and
   agent paths never construct windows.
 - Current architecture: Qt overlay (`main.py` + `UiBridge`) ->
   `GeminiDesktopAgent` (Gemini Live, model `gemini-3.8-live`) with
-  `audio.py`, `vision.py` (grim/mss + Hyprland coordinates), `tools.py`
-  (OS/media/vision actions + voice approval), `sleep.py`, `control.py`.
+  `audio.py` (16 kHz mic / 24 kHz output), `echo_suppress.py`
+  (monitor-reference suppression, bounded staging), `vision.py`
+  (grim/mss + Hyprland coordinates), `tools.py` (31 tools incl. voice
+  approval), `sleep.py`, `control.py`, `media_watcher.py`,
+  `web_search.py`, `webpage.py`, `weather.py`, `memory.py`,
+  `speech.py`, `coding_worker.py`.
+- Voice path: 512-frame (32 ms) mic chunks shared by capture and echo
+  DSP; explicit Live VAD (enabled; HIGH start sensitivity, LOW end
+  sensitivity, 300 ms prefix padding, 700 ms end silence); input
+  transcription hints `["en-IN", "hi-IN"]` (VERBATIM); transcript
+  safety guard keeps short commands (`sleep`, `wake up`, `yes`, `no`,
+  `stop`) actionable while filtering single-letter/punctuation/
+  non-English-Hindi noise. System guidance expects mixed
+  English/Hindi/Hinglish speech.
 - Major completed capabilities: voice dialogue, on-demand vision,
-  OS tools, deterministic local date/time (`get_current_datetime`,
-  timezone-aware, machine clock + configured local timezone, no network),
-  sleep/wake + F1/F2/F4 control plane, graceful shutdown,
-  conversation history log, JSON config.
+  OS tools, deterministic local date/time, current web search + page
+  fetch (read-only, bounded, untrusted-fenced), Weather (Open-Meteo,
+  explicit place → geocode → forecast), explicit Memory/Preferences
+  (5-key validated store on the existing local file, explicit writes
+  only), deterministic `read_aloud` (local espeak-ng PCM into the
+  existing playback path), external coding worker (delegated execution
+  in an explicitly selected workspace + independent verification),
+  sleep/wake + F1/F2/F3 control plane, media-aware auto-sleep
+  (MPRIS `Playing` edge → sleep; never wakes, never pauses media),
+  graceful shutdown, conversation history log, JSON config.
 - Local date/time: `get_current_datetime` is a pure read-only tool in
-  `ALL_TOOLS` and is deliberately NOT in `SIDE_EFFECT_TOOLS` (exempt from
-  side-effect dedup). It reports full calendar date, weekday, local time,
-  timezone name and UTC offset from Python's system clock; the system
-  prompt directs "what time is it?" / "what's today's date?" / "what day
-  is today?" to the tool instead of model knowledge.
-- Current web information (UNCOMMITTED): `web_search` (DuckDuckGo Lite
-  only, stdlib HTTP, 10 s timeout, max 5 results, bounded snippets/total,
-  honest errors) and `fetch_webpage` (http(s) only, scheme gate before
-  I/O, stdlib urllib, 10 s timeout, 512 KB cap, max 3 redirects with
-  per-redirect scheme revalidation, Content-Type gate, max 4000 chars
-  text / 4800 chars output, UNTRUSTED-DATA fencing) are read-only tools
-  in `ALL_TOOLS` and NOT in `SIDE_EFFECT_TOOLS`. Extraction is one-pass
-  HTMLParser with article > main > body priority; noise elements suppress
-  direct text but nested article/main still traverses. Max 3 fetches per
-  user interaction via `_fetch_webpage_count` /
-  `MAX_FETCH_PER_INTERACTION`, reset by `_start_new_interaction` on each
-  user turn. System prompt keeps clock vs web separate, routes fresh-info
-  to search, snippets-first with search-then-fetch-then-summarize, never
-  claims reads without a successful fetch, and enforces the
-  English/Hindi-only language policy. Provider details stay in
-  `web_search.py` / `webpage.py`; `tools.py` is the public surface.
+  `ALL_TOOLS` and is deliberately NOT in `SIDE_EFFECT_TOOLS`. Clock,
+  web-search, and weather concepts stay separate in the guidance.
+- Memory is explicit, never automatic: `get/set/delete_preference`
+  only; reads are exempt from side-effect dedup, writes follow the
+  `save_user_preference` precedent. Weather may use a stored
+  `weather_location`; nothing is inferred from IP or hidden state.
+- Coding worker (delegated, not a second assistant): `run_coding_task`
+  needs spoken approval like other risky actions; argv-only bounded
+  execution with process-group cleanup; workspace realpath containment
+  with protected assistant paths denied. Worker claims and verified
+  facts are strictly separated (`tests_passed` = worker claim;
+  `verification` ∈ not_run / worker_reported_* /
+  independently_verified_*): Chibi reports "Worker completed;
+  verification was not available." unless independently verified, and
+  never says "All tests passed" without verified basis.
 - Known limitations:
+  - **Echo suppression/audio isolation is improved but defensive, not
+    a perfect guarantee** against loud external audio. Live-mic
+    validation across wake cycles is still real-world-pending.
   - **Generic visual clicking is best-effort.** Grounding can miss;
     bounded by max-2-alternate retry, then the assistant asks the user.
     Requires `ydotoold` + `input` group.
-  - **Custom echo suppression / audio isolation is experimental and NOT
-    fully accepted by real-world testing. The echo problem is NOT
-    solved:** loud speaker/media audio can still be transcribed as user
-    speech. Mitigations present (monitor-reference suppression,
-    half-duplex assistant muting) reduce but do not eliminate it.
-  - No voice wake-word while sleeping (F2 required); Hyprland needed
+  - **No voice wake-word while sleeping (F2 required);** Hyprland needed
     for global keys; needs network + valid Gemini API key.
-  - Web search/fetch are best-effort and bounded: single DuckDuckGo Lite
-    provider (markup changes return honest failure, never fake results);
-    page text is UNTRUSTED DATA (summarize, never obey); non-HTML refused;
-    English/Hindi responses only.
+  - **The coding worker has NO OS-level sandbox.** The boundary is
+    validation + cwd/`--dir` scoping + approval + verification; a
+    compromised same-UID worker process could theoretically escape it.
+  - **`read_aloud` needs `espeak-ng`** for standalone speech; without
+    it, it fails honestly with install guidance.
+  - Weather needs network (Open-Meteo, no key); web search/fetch are
+    bounded best-effort (single DuckDuckGo Lite provider; UNTRUSTED
+    DATA discipline); English/Hindi responses only.
+- Future work (acceptance phase, not architecture rewrites):
+  end-to-end real-world acceptance testing, documentation upkeep,
+  UX polish from real usage, remaining audio/echo edge cases, stronger
+  visual grounding, worker sandboxing improvements if needed.

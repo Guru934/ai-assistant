@@ -1,3 +1,8 @@
+# ARCHIVED HISTORICAL CHECKLIST (project-start era; all items below are long complete)
+
+> Preserved as history — see `ROADMAP.md` for the current roadmap
+> (374 tests passing at checkpoint `5ee950c`). Boxes below are not open work.
+
 # Cat Talker - Task List
 
 ## Phase 1: Critical Bug Fixes

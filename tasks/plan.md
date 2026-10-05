@@ -1,3 +1,11 @@
+# ARCHIVED HISTORICAL PLAN (project-start era; all items below are long complete)
+
+> This document is preserved as history. It describes the very first
+> bug-fix plan from before checkpoint `5ee950c`. Current state, roadmap,
+> and test counts live in `PROJECT_STATUS.md`, `ROADMAP.md`, and
+> `README.md` (374 tests passing). Do not treat unchecked boxes below
+> as open work.
+
 # Implementation Plan: Cat Talker Bug Fixes & Improvements
 
 ## Overview

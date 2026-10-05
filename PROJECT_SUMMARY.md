@@ -22,7 +22,10 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Vision**: `grim` (Wayland native) OR `mss` (X11) → 1024x[proportional] JPEG on-demand
 - **OS Control**: `ydotool` + `subprocess` + `shutil.which` + `wpctl` + `brightnessctl`
 - **UI**: `PyQt6` frameless transparent overlay with dynamic QPainter animations
-- **API**: `google-genai` SDK, model `gemini-3.1-flash-live-preview`
+- **API**: `google-genai` SDK, model `gemini-3.8-live`
+- **Voice path**: 512-frame (32 ms) 16 kHz mic chunks, explicit Live VAD
+  (enabled; HIGH start / LOW end sensitivity, 300 ms prefix, 700 ms end
+  silence), `en-IN`/`hi-IN` transcription hints, transcript safety guard
 - **Logging**: Structured logging with configurable levels (DEBUG/INFO/WARNING/ERROR)
 - **Reconnection**: Exponential backoff with jitter (max 60s)
 
@@ -39,7 +42,9 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Settings Persistence** - API key, preferred monitor, auto-reconnect, voice approval saved to `~/.config/cat-talker/config.json`
 - **Modular Design** - Cleanly separated audio, vision, config, logging, and AI modules
 - **Structured Logging** - All modules use structured logging (DEBUG/INFO/WARNING/ERROR)
-- **Unit Tests** - 9 tests covering config, vision, tools
+- **Unit Tests** - 374 tests covering lifecycle, audio, sleep/wake,
+  control/launch, vision, tools, web info, Weather, Memory, TTS, coding
+  worker + verification, diagnostics (see "Test Results" below)
 
 ### ✅ OS Tools (Auto-Execute - No Approval)
 | Tool | Description |
@@ -61,6 +66,15 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 | `set_clipboard(text)` | Set system clipboard via `wl-copy` |
 | `send_notification(title, body)` | Desktop notification via `notify-send` |
 | `save_user_preference(key, value)` | Persistent user memory to `~/.config/cat-talker/memory.json` |
+| `get_current_datetime()` | Local date/time from the system clock (read-only) |
+| `web_search(query)` | Current web search, DuckDuckGo Lite, bounded, honest failures |
+| `fetch_webpage(url)` | Page fetch + readable extraction, UNTRUSTED-DATA fenced |
+| `get_weather(location, days?)` | Open-Meteo geocode → forecast, °C/km/h |
+| `get_preference(key)` | Read an explicitly stored preference (read-only) |
+| `set_preference(key, value)` | Explicitly save a preference (validated keys) |
+| `delete_preference(key)` | Explicitly delete a preference |
+| `read_aloud(text)` | Speak text via local `espeak-ng` through existing playback |
+| `run_coding_task(task, workspace)` | Delegate coding work (voice approval; verified reporting) |
 
 ### ⚠️ Risky Tools (Voice Confirmation Required)
 | Tool | Description | Confirmation |
@@ -71,7 +85,20 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 | `confirm_action()` | Execute pending risky action after user says "yes" | - |
 | `cancel_action()` | Cancel pending risky action | - |
 
-*Note: Voice confirmation is implemented natively in `tools.py` by caching the tool payload for 120 seconds and requiring the model to ask the user out loud. The user's vocal "yes" naturally leads the model to execute the `confirm_action` tool.*
+*Note: Voice confirmation is implemented natively in `tools.py` by caching the tool payload for 120 seconds and requiring the model to ask the user out loud. The user's vocal "yes" naturally leads the model to execute the `confirm_action` tool. Coding delegation (`run_coding_task`) uses the same approval flow.*
+
+### ✅ Later milestones (all implemented, unit-tested)
+- **Local date/time, web search + page fetch** (bounded, untrusted-fenced)
+- **Weather** (Open-Meteo, explicit place, honest errors)
+- **Memory/Preferences** (explicit 5-key validated store; never automatic)
+- **Read-aloud TTS fallback** (local engine, replaceable boundary)
+- **Sleep/wake hardening** (single mic-worker ownership, serialized
+  stream recreation, single-instance launch locking, no headless
+  duplicates)
+- **Media-aware auto-sleep** (read-only MPRIS `Playing`-edge watcher)
+- **Transcript safety guard** + audio/transcript diagnostics
+- **External coding worker** (delegated execution + independent
+  verification; worker claims ≠ verified facts)
 
 ## Project Structure
 ```
@@ -82,7 +109,18 @@ cat-talker/
 │   ├── agent.py             # Gemini Live orchestration + exponential backoff reconnect
 │   ├── audio.py             # Audio streams + fixed volume calc + idempotent close()
 │   ├── vision.py            # Multi-monitor Grim/MSS capture with monitor targeting
-│   ├── tools.py             # 22 OS tools with monitor param support
+│   ├── tools.py             # 31 tools with monitor param support
+│   ├── sleep.py             # Sleep/wake state machine + idle policy
+│   ├── control.py           # Control socket server (runtime-dir locking)
+│   ├── media_watcher.py     # Read-only MPRIS Playing-edge watcher
+│   ├── web_search.py        # Current web search (DuckDuckGo Lite)
+│   ├── webpage.py           # Page fetch + readable extraction
+│   ├── weather.py           # Open-Meteo geocode → forecast
+│   ├── memory.py            # Explicit validated preferences
+│   ├── speech.py            # Standalone TTS boundary (local engine)
+│   ├── coding_worker.py     # Delegated execution + verification
+│   ├── echo_suppress.py     # Monitor-reference echo suppression
+│   ├── earcons.py           # UI earcons
 │   ├── config.py            # Settings persistence (JSON)
 │   ├── logging_config.py    # Structured logging setup
 │   └── tests/
@@ -106,42 +144,47 @@ pyautogui>=0.9.54  # pulls ydotool deps
 *Requires `grim` system package for Wayland screen capture, `brightnessctl` for brightness, `ydotool` + `ydotoold` for input simulation.*
 
 ## How to Run
-```fish
-cd ~/cat-talker
-source .venv/bin/activate.fish
+```bash
+cd /home/guru/ai-assistant
+PYTHONPATH=src .venv/bin/python -m cat_talker.main
+# or: export GEMINI_API_KEY=your_key_here  # Or set once, saved to config
 sudo systemctl start ydotoold 2>/dev/null || ydotoold &
-export GEMINI_API_KEY=your_key_here  # Or set once, saved to config
-python -m cat_talker.main
+```
+
+Daily control (any directory, plus Hyprland F1 = UI, F2 = sleep/wake,
+F3 = quit):
+```bash
+/home/guru/ai-assistant/bin/assistant-control toggle
+/home/guru/ai-assistant/bin/assistant-control status
 ```
 
 Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ## Test Results
-```
-============================= test session starts ==============================
-collected 9 items
-
-tests/test_core.py::test_config_load_save PASSED
-tests/test_core.py::test_config_auto_reconnect PASSED
-tests/test_core.py::test_config_voice_approval PASSED
-tests/test_core.py::test_config_preferred_monitor PASSED
-tests/test_core.py::test_vision_interface_initialization PASSED
-tests/test_core.py::test_vision_capture_frame PASSED
-tests/test_core.py::test_tool_map_complete PASSED (22 tools)
-tests/test_core.py::test_take_screenshot_function PASSED
-tests/test_core.py::test_inspect_screen_function PASSED
-
-========================= 9 passed in 0.69s ===========================
+```bash
+./.venv/bin/python -m pytest -q
+# 374 passed — no hardware, network, speakers, or credentials needed
+# (fakes for Live sessions, audio, vision, Qt offscreen, playerctl,
+# subprocess, network). See README "How to run tests" for coverage.
 ```
 
 ## Known Issues / Next Steps
 
-### 🔴 Critical
-- **ydotool on Wayland**: Requires `ydotoold` daemon running + user in `input` group
-- **Proxy API Key**: Current key (`AQ.Ab8...`) is a dev proxy, not native Google AI Studio key.
+### Current limitations (honest, see README/PROJECT_STATUS.md for detail)
+- **Echo suppression/audio isolation** is improved but defensive, not a
+  perfect guarantee; live-mic validation across wake cycles is
+  real-world-pending.
+- **Generic visual clicking** is best-effort (`ydotoold` + `input` group).
+- **No voice wake-word** while sleeping (F2 required); Hyprland needed
+  for global keys; needs network + valid Gemini API key.
+- **Coding worker has no OS-level sandbox**; worker-reported tests are
+  claims until independently verified.
+- **`read_aloud` needs `espeak-ng`**; Weather needs network; web
+  search/fetch are bounded best-effort; English/Hindi responses only.
 
-### 🟡 Enhancements Needed
-1. **Wake Word Detection** - Replace hotkey with `openwakeword` for hands-free activation
+### 🟡 Enhancements (genuinely future)
+1. **Wake Word Detection** - `openwakeword` for hands-free activation
+   (optional dependency; F2 remains the mechanism today)
 2. **System Tray** - Minimize to tray, show status, quick actions
 3. **Settings UI** - In-app configuration panel (hotkeys, monitor, voice, approvals)
 4. **API Key Encryption** - Encrypt stored API key (currently plaintext in config.json)
@@ -149,11 +192,12 @@ tests/test_core.py::test_inspect_screen_function PASSED
 
 ### 🟢 Nice to Have
 - **Plugin System** - Dynamic tool loading
-- **Multi-language Support** - i18n for UI and prompts
 - **Usage Analytics** - Local opt-in telemetry
 - **Offline Mode** - Fallback to local LLM (llama.cpp) when API unavailable
 
 ---
 
-*Last Updated: 2026-09-23*
-*Session: Cat Talker v2.0 - Multi-Monitor Vision, Settings Persistence, Logging, Testing, Bug Fixes*
+*Last verified: 2026-10-05 at checkpoint `5ee950c` (374 tests passing).
+Historical note (2026-09-23 session): Cat Talker v2.0 brought
+multi-monitor vision, settings persistence, logging, early bug fixes —
+all of the above supersedes that snapshot.*
