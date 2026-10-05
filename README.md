@@ -161,7 +161,14 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 - **F1** = show/hide UI only. Never wakes, never sleeps, never reconnects.
 - **F2** = sleep/wake toggle. Sleeping closes the Live session; waking
   opens a fresh one. Deferred (never interrupted) mid tool call/response.
-  Voice "go to sleep" also sleeps; there is no voice-wake from sleep.
+  Voice "go to sleep" also sleeps. Optional local wake-word ("Hey Jarvis",
+  off by default) can also wake: install with
+  `.venv/bin/python -m pip install openwakeword`, then set
+  `wake_word_enabled: true` in `~/.config/cat-talker/config.json`.
+  Detection is fully offline (no audio leaves the PC, no Gemini session
+  while sleeping) and wakes through the same path as F2. A custom
+  "Hey Chibi" model needs a trained `.onnx` (set `wake_word_model` to
+  its path); the built-in `hey_jarvis` model is the validated default.
 - **F3** = graceful quit (session closes, audio closes, Qt exits).
 
 ## Major security boundaries

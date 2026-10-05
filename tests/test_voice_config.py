@@ -78,10 +78,13 @@ def test_live_config_keeps_audio_modality_and_tools():
     config = build_live_config("instructions")
     mods = config.response_modalities
     assert mods is not None
+    # AUDIO-only: the Live API rejects AUDIO+TEXT for this model
+    # (API 1007), so assistant TEXT comes from the audio transcript.
     assert types.Modality.AUDIO in mods
-    assert types.Modality.TEXT in mods
-    # Audio path untouched: audio still streams for playback.
-    assert len(mods) == 2
+    assert types.Modality.TEXT not in mods
+    assert len(mods) == 1
+    # ...while output transcription stays enabled as the TEXT source.
+    assert config.output_audio_transcription is not None
     # The SDK copies the tool list; elements are the same callables.
     assert config.tools is not None
     assert list(config.tools) == list(ALL_TOOLS)

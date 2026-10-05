@@ -37,7 +37,17 @@ def _text_msg(text, audio_data=None):
     return pytypes.SimpleNamespace(
         server_content=pytypes.SimpleNamespace(
             interrupted=False, turn_complete=False,
-            model_turn=pytypes.SimpleNamespace(parts=parts)),
+            model_turn=pytypes.SimpleNamespace(parts=parts),
+            output_transcription=None),
+        client_content=None, tool_call=None)
+
+
+def _output_transcription_msg(text):
+    """Transcript-of-audio event (the TEXT source under AUDIO modality)."""
+    return pytypes.SimpleNamespace(
+        server_content=pytypes.SimpleNamespace(
+            interrupted=False, turn_complete=False, model_turn=None,
+            output_transcription=pytypes.SimpleNamespace(text=text)),
         client_content=None, tool_call=None)
 
 
@@ -199,6 +209,39 @@ def test_user_transcript_stays_distinct():
     models = [t for r, t in heard if r == "model"]
     assert users == ["open youtube"], heard
     assert models == ["Opening YouTube."], heard
+
+
+def test_output_transcription_is_the_text_source():
+    """Under AUDIO modality, transcript-of-audio events assemble, stream,
+    and flush exactly like model_turn text."""
+    agent = make_agent()
+    heard = []
+    _run_text_session(agent, [_output_transcription_msg("Hello "),
+                              _output_transcription_msg("Hello there"),
+                              _turn_complete_msg()], heard)
+    models = [t for r, t in heard if r == "model"]
+    assert models == ["Hello there"], heard
+
+
+def test_transcript_and_audio_coexist_without_duplication():
+    """Same content via audio part + transcript event: audio plays, text
+    appears exactly once."""
+    agent = make_agent()
+    audio = agent.audio
+    heard = []
+    msg = pytypes.SimpleNamespace(
+        server_content=pytypes.SimpleNamespace(
+            interrupted=False, turn_complete=False,
+            model_turn=pytypes.SimpleNamespace(parts=[
+                pytypes.SimpleNamespace(
+                    inline_data=pytypes.SimpleNamespace(data=b"\x07"),
+                    text=None)]),
+            output_transcription=pytypes.SimpleNamespace(text="Hi.")),
+        client_content=None, tool_call=None)
+    _run_text_session(agent, [msg, _turn_complete_msg()], heard)
+    assert audio.output == [b"\x07"]
+    models = [t for r, t in heard if r == "model"]
+    assert models == ["Hi."], heard
 
 
 def test_coding_report_text_flows_through_model_role():

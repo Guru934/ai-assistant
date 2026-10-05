@@ -207,10 +207,22 @@ class AudioInterface:
     def resume_input(self):
         self._input_paused = False
 
+    # Optional wake-word tap: when set (sleeping + wake-word enabled), a
+    # copy of each dropped mic chunk is offered to the local detector.
+    # Same single capture stream, no second device open, never blocks:
+    # feed() only enqueues. Cleared when the detector stops.
+    wake_tap = None
+
     def _mic_callback(self, in_data, frame_count, time_info, status):
         if not self._running or self._loop_closed:
             return (None, pyaudio.paComplete)
         if getattr(self, "_input_paused", False):
+            tap = getattr(self, "wake_tap", None)
+            if tap is not None:
+                try:
+                    tap(bytes(in_data))
+                except Exception:
+                    pass
             dropped = getattr(self, "_paused_dropped", 0) + 1
             self._paused_dropped = dropped
             return (None, pyaudio.paContinue)

@@ -15,6 +15,20 @@ DEFAULT_CONFIG = {
     "auto_reconnect": True,
     "voice_approval_enabled": True,
     "echo_suppress_enabled": True,
+    # Local wake-word activation (optional, default OFF). When enabled,
+    # the sleeping assistant monitors the already-open mic stream for
+    # the configured phrase and wakes through the normal F2 path - fully
+    # offline (openwakeword), no audio leaves the machine, no Gemini
+    # session while sleeping. Default off because it is continuous
+    # local microphone monitoring: enabling it must be explicit.
+    # wake_word_model: a built-in openwakeword model key ("hey_jarvis",
+    # "hey_mycroft", "alexa", "timer", "weather") or an absolute path to
+    # a custom trained .onnx (e.g. a future "Hey Chibi" model).
+    # wake_word_phrase is the human label of what to say.
+    "wake_word_enabled": False,
+    "wake_word_phrase": "Hey Jarvis",
+    "wake_word_model": "hey_jarvis",
+    "wake_word_threshold": 0.5,
 }
 
 
@@ -119,4 +133,56 @@ def set_voice_approval(enabled: bool) -> str:
     """Set voice approval enabled setting and save config."""
     config = load_config()
     config["voice_approval_enabled"] = enabled
+    return save_config(config)
+
+
+def get_wake_word_enabled() -> bool:
+    """Local wake-word activation enabled (default off)."""
+    return bool(load_config().get("wake_word_enabled", False))
+
+
+def set_wake_word_enabled(enabled: bool) -> str:
+    """Enable/disable local wake-word activation and save config."""
+    config = load_config()
+    config["wake_word_enabled"] = bool(enabled)
+    return save_config(config)
+
+
+def get_wake_word_phrase() -> str:
+    """Human label of the wake phrase (default "Hey Jarvis")."""
+    phrase = load_config().get("wake_word_phrase", "Hey Jarvis")
+    return phrase if isinstance(phrase, str) and phrase.strip() else "Hey Jarvis"
+
+
+def get_wake_word_model() -> str:
+    """Built-in openwakeword model key or absolute custom .onnx path."""
+    model = load_config().get("wake_word_model", "hey_jarvis")
+    return model if isinstance(model, str) and model.strip() else "hey_jarvis"
+
+
+def get_wake_word_threshold() -> float:
+    """Detection threshold in (0, 1]; out-of-range values clamp to 0.5."""
+    try:
+        threshold = float(load_config().get("wake_word_threshold", 0.5))
+    except (TypeError, ValueError):
+        return 0.5
+    if not 0.0 < threshold <= 1.0:
+        return 0.5
+    return threshold
+
+
+def set_wake_word(phrase: str, model: str = "", threshold: float = 0.5) -> str:
+    """Configure the wake phrase/model/threshold and save config."""
+    config = load_config()
+    if isinstance(phrase, str) and phrase.strip():
+        config["wake_word_phrase"] = phrase.strip()
+    if isinstance(model, str) and model.strip():
+        config["wake_word_model"] = model.strip()
+    try:
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        threshold = 0.5
+    if not 0.0 < threshold <= 1.0:
+        threshold = 0.5
+    config["wake_word_threshold"] = threshold
     return save_config(config)

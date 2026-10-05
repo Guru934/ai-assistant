@@ -610,8 +610,13 @@ def _ydotool_dispatch(argv, what: str, timeout: int = 10):
 def _check_frame_seq(frame_seq):
     """Stale-frame gate shared by click_screen's pre-approval check and its
     execution path. Returns an honest failure string, or None when the
-    coordinates are grounded on the current frame."""
-    if frame_seq is None:
+    coordinates are grounded on the current frame.
+
+    frame_seq 0 (the tool default) means "not provided": sequence numbers
+    start at 1, so 0 is never a valid frame. An int default (rather than
+    None) keeps the Gemini function-calling schema parser happy.
+    """
+    if not frame_seq:
         return ("Stale frame: no frame_seq given. Coordinates must come from "
                 "the CURRENT screenshot - call inspect_screen once and pass "
                 "the frame_seq stated with that frame. Click NOT sent.")
@@ -630,7 +635,7 @@ def _check_frame_seq(frame_seq):
     return None
 
 
-def click_screen(x: int, y: int, target_description: str = "", frame_seq=None) -> str:
+def click_screen(x: int, y: int, target_description: str = "", frame_seq: int = 0) -> str:
     """Click at image-space coordinates x, y.
 
     Args:

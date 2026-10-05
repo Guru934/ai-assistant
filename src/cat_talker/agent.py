@@ -378,13 +378,16 @@ def build_live_config(system_instructions: str):
       700 ms end silence avoids cutting sentences early;
     - input transcription stays VERBATIM (mode unset = SDK default) with
       explicit ["en-IN", "hi-IN"] hints for Indian English/Hindi/Hinglish.
-    - response modalities are AUDIO (existing playback path, untouched)
-      plus TEXT: assistant text arrives as model_turn text parts, is
-      assembled by ResponseTextAccumulator, streamed to the UI bubble,
-      and written to history once per completed response.
+    - response modality stays AUDIO-only: the Live API rejects the
+      AUDIO+TEXT combination for this model (API 1007), so assistant
+      TEXT comes from output_audio_transcription events instead. The
+      audio playback path is untouched; transcript text is assembled by
+      ResponseTextAccumulator, streamed to the UI bubble, and written to
+      history once per completed response. output_transcription is the
+      transcript OF the audio output, so the two can never disagree.
     """
     return types.LiveConnectConfig(
-        response_modalities=[types.Modality.AUDIO, types.Modality.TEXT],
+        response_modalities=[types.Modality.AUDIO],
         system_instruction=types.Content(
             parts=[types.Part(text=system_instructions)]),
         output_audio_transcription=types.AudioTranscriptionConfig(
@@ -851,6 +854,8 @@ class GeminiDesktopAgent:
             except Exception:
                 pass
             self._cancel_session_tasks()
+            logger.info("GEMINI_SESSION_STOPPED")
+            logger.info("SLEEPING")
         return disp
 
     def request_wake(self) -> str:
@@ -870,6 +875,80 @@ class GeminiDesktopAgent:
         if self.sleep.is_sleeping():
             return self.request_wake()
         return self.request_sleep()
+
+    def _on_wake_word(self):
+        """Local wake-word hook: exactly the F2 transition, nothing more.
+
+        Thread-safe (detector thread): request_wake() is plain flag writes
+        plus the same wake-event signal F2 uses. Duplicate detections while
+        awake return "already" - they can never open a second session.
+        """
+        disp = self.request_wake()
+        logger.info("WAKE_WORD_DETECTED disp=%s", disp)
+        return disp
+
+    def _maybe_start_wake_detector(self):
+        """Start the local wake detector for this sleep stretch, or None.
+
+        None means wake-word is disabled, unavailable, or there is no
+        audio device to tap: sleeping/F2 behavior is then exactly as
+        before. Never raises, never opens Gemini, never touches the mic
+        stream itself (the tap rides the already-open capture callback).
+        """
+        try:
+            from cat_talker import wakeword as wakeword_mod
+            from cat_talker.config import load_config
+            # Deterministic operator/test switch (same pattern as
+            # CAT_TALKER_MEDIA_WATCH): 0 forces off, 1 forces on,
+            # unset follows the config file.
+            import os as _os
+            override = _os.environ.get("CAT_TALKER_WAKEWORD", "").strip()
+            if override == "0":
+                logger.debug("wake detector off (CAT_TALKER_WAKEWORD=0)")
+                return None
+            cfg = load_config()
+            enabled = True if override == "1" else bool(
+                cfg.get("wake_word_enabled", False))
+            if not enabled:
+                logger.debug("wake detector off (wake_word_enabled=false)")
+                return None
+            audio = getattr(self, "audio", None)
+            if audio is None:
+                logger.warning("wake detector: no audio device to tap")
+                return None
+            detector = wakeword_mod.create_detector(
+                model=cfg.get("wake_word_model", "hey_jarvis"),
+                phrase=cfg.get("wake_word_phrase", "Hey Jarvis"),
+                threshold=cfg.get("wake_word_threshold", 0.5),
+                on_wake=self._on_wake_word)
+            if detector is None:
+                logger.warning("wake detector unavailable "
+                               "(openwakeword/model missing?) - F2 still wakes")
+                return None
+            detector.start()
+            audio.wake_tap = detector.feed
+            logger.info("WAKE_DETECTOR_STARTED phrase=%r model=%r",
+                        cfg.get("wake_word_phrase", "Hey Jarvis"),
+                        cfg.get("wake_word_model", "hey_jarvis"))
+            return detector
+        except Exception as e:
+            logger.warning("wake detector start failed: %s", e)
+            return None
+
+    def _stop_wake_detector(self, detector):
+        """Stop the detector and detach the tap (no-op for None)."""
+        try:
+            audio = getattr(self, "audio", None)
+            if audio is not None and getattr(audio, "wake_tap", None) is not None:
+                try:
+                    audio.wake_tap = None
+                except Exception:
+                    pass
+            if detector is not None:
+                detector.stop()
+                logger.info("WAKE_DETECTOR_STOPPED")
+        except Exception as e:
+            logger.warning("wake detector stop failed: %s", e)
 
     async def run_loop(self, volume_callback=None, app_quit_callback=None, text_callback=None,
                        state_callback=None, bubble_callback=None, glow_callback=None,
@@ -956,19 +1035,27 @@ class GeminiDesktopAgent:
                     # forwarding. Pause capture here (not only on the
                     # request path) so a process born sleeping never
                     # accumulates an unbounded mic queue. Wait for F2 /
-                    # explicit wake or shutdown.
+                    # explicit wake, local wake-word, or shutdown.
                     self._set_sleep_mic_paused(True)
+                    logger.info("SLEEPING")
                     self._set_state(state_callback, "idle")
                     if bubble_callback:
                         bubble_callback("😴 Sleeping — press F2 to wake")
+                    detector = self._maybe_start_wake_detector()
                     self._wake_event.clear()
-                    while (self.sleep.is_sleeping()
-                           and not self.stop_event.is_set()):
-                        try:
-                            await asyncio.wait_for(
-                                self._wake_event.wait(), timeout=0.5)
-                        except asyncio.TimeoutError:
-                            pass
+                    try:
+                        while (self.sleep.is_sleeping()
+                                and not self.stop_event.is_set()):
+                            try:
+                                await asyncio.wait_for(
+                                    self._wake_event.wait(), timeout=0.5)
+                            except asyncio.TimeoutError:
+                                pass
+                    finally:
+                        # Leaving sleep (wake or shutdown): the detector
+                        # must not survive into the Gemini session.
+                        self._stop_wake_detector(detector)
+                    logger.info("GEMINI_SESSION_STARTING")
                     continue
                 try:
                     logger.info(f"Opening Gemini Live session (model: {model})")
@@ -1281,11 +1368,24 @@ class GeminiDesktopAgent:
                                                     # Assistant TEXT delta: assembled and
                                                     # streamed to the UI bubble; the full
                                                     # response flushes on turn_complete.
-                                                    # output_transcription events (audio
-                                                    # transcript of the same content) are
-                                                    # deliberately NOT consumed here, so
-                                                    # text is never duplicated.
+                                                    # Under AUDIO-only modality model_turn
+                                                    # carries audio; the TEXT comes from
+                                                    # output_transcription below (transcript
+                                                    # OF that audio, so they agree). Both
+                                                    # feed the same accumulator, whose
+                                                    # duplicate suppression keeps text
+                                                    # singular if both ever fire.
                                                     self._handle_model_text(part, text_callback)
+
+                                            # Transcript of the model's audio output
+                                            # (enabled via output_audio_transcription):
+                                            # the TEXT stream for UI/history.
+                                            out_trans = getattr(
+                                                msg.server_content,
+                                                "output_transcription", None)
+                                            if out_trans is not None:
+                                                self._handle_model_text(
+                                                    out_trans, text_callback)
 
                                         if hasattr(msg, "client_content") and msg.client_content:
                                             for turn in getattr(msg.client_content, "turns", []):
