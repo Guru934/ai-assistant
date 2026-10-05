@@ -776,10 +776,12 @@ def main():
     app.setDesktopFileName("cat-talker-overlay")
     app.setFont(QFont("Outfit", 10))
 
-    from cat_talker.config import load_config
+    from cat_talker.config import (
+        load_config, is_api_key_configured, migrate_legacy_api_key)
     c = load_config()
-    if not c.get("api_key") and not os.environ.get("GEMINI_API_KEY"):
-        QMessageBox.critical(None, "Missing API Key", "API key missing! Check ~/.config/cat-talker/config.json")
+    migrate_legacy_api_key()
+    if not is_api_key_configured():
+        QMessageBox.critical(None, "Missing API Key", "API key missing! Set GEMINI_API_KEY, or add one in Settings (stored in the OS keyring).")
         sys.exit(1)
 
     window = get_overlay_window()

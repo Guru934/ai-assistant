@@ -27,8 +27,35 @@ from PyQt6.QtWidgets import QApplication
 _qt_app = QApplication.instance() or QApplication([])
 
 
+class FakeKeyring:
+    """In-memory stand-in for the OS credential store (no real keyring)."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get_password(self, service, account):
+        return self.store.get((service, account))
+
+    def set_password(self, service, account, value):
+        self.store[(service, account)] = value
+
+    def delete_password(self, service, account):
+        try:
+            del self.store[(service, account)]
+        except KeyError:
+            raise LookupError("no password stored")
+
+
 @pytest.fixture
-def isolated_stores(tmp_path, monkeypatch):
+def fake_backend(monkeypatch):
+    import cat_talker.credentials as credentials_mod
+    fake = FakeKeyring()
+    monkeypatch.setattr(credentials_mod, "_backend", lambda: fake)
+    return fake
+
+
+@pytest.fixture
+def isolated_stores(tmp_path, monkeypatch, fake_backend):
     """Redirect config file + memory store into tmp.
 
     NOTE: memory._DEFAULT_STORE binds its path at import, so patching

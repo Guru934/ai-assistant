@@ -9,7 +9,12 @@ dependencies = [
     "opencv-python>=4.11.0.86",
     "PyQt6>=6.8.1",
     "markdown>=3.6",
-    "pygments>=2.17"
+    "pygments>=2.17",
+    # Optional-at-runtime API-key credential backend (Secret Service via
+    # keyring). The assistant starts without it, but API keys can then
+    # only come from GEMINI_API_KEY - persisted storage needs this.
+    "keyring>=25.0.0",
+    "secretstorage>=3.3.0",
 ]
 requires-python = ">=3.10"
 

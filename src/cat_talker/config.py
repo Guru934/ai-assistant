@@ -64,37 +64,155 @@ def save_config(config: Dict[str, Any]) -> str:
         return f"Error saving config: {e}"
 
 
+def _legacy_file_key() -> str:
+    """Raw api_key from config.json ONLY (no env merge, no migration).
+
+    Empty when absent/unreadable. Used for migration detection and as a
+    degraded fallback when the secure store is unavailable.
+    """
+    try:
+        if not os.path.exists(CONFIG_PATH):
+            return ""
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return ""
+        value = data.get("api_key", "")
+        return value if isinstance(value, str) and value.strip() else ""
+    except Exception:
+        return ""
+
+
+def _scrub_legacy_file_key() -> bool:
+    """Remove a plaintext api_key from config.json, keeping everything
+    else byte-for-byte equivalent. Returns True when no key remains."""
+    try:
+        if not os.path.exists(CONFIG_PATH):
+            return True
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return True
+        if not data.get("api_key"):
+            return True
+        data["api_key"] = ""
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        return True
+    except Exception as e:
+        logger.error(f"Error scrubbing legacy API key: {e}")
+        return False
+
+
+def migrate_legacy_api_key() -> tuple:
+    """Move a plaintext config.json key into the secure store.
+
+    Returns (status, message) with status in migrated / nothing-to-migrate
+    / backend-unavailable. Safe and idempotent: the file is scrubbed only
+    after the secure write verifies, so a failed migration keeps the old
+    value untouched (and loudly reports the backend problem).
+    """
+    from cat_talker import credentials as credentials_mod
+    legacy = _legacy_file_key()
+    if not legacy:
+        return "nothing-to-migrate", "No plaintext API key in config.json."
+    ok, message = credentials_mod.save_key(legacy)
+    if not ok:
+        logger.warning("API-key migration deferred: %s", message)
+        return "backend-unavailable", message
+    if not _scrub_legacy_file_key():
+        logger.error("API key stored securely, but the plaintext copy "
+                     "could not be removed from config.json - remove it "
+                     "manually.")
+        return "migrated", ("API key stored securely, but config.json "
+                             "could not be scrubbed; remove it manually.")
+    logger.info("API key migrated from config.json to the secure store.")
+    return "migrated", "API key migrated to secure storage."
+
+
+def credential_status() -> dict:
+    """Honest credential report: where the key would come from, and
+    whether the secure backend is usable. Never includes key material."""
+    from cat_talker import credentials as credentials_mod
+    if credentials_mod.get_key():
+        backend = ("available" if credentials_mod.backend_working()
+                   else "unreachable")
+        return {"source": "secure-store", "backend": backend,
+                "migrated": not bool(_legacy_file_key())}
+    if os.environ.get("GEMINI_API_KEY"):
+        return {"source": "environment",
+                "backend": ("available" if credentials_mod.available()
+                            else "missing"),
+                "migrated": not bool(_legacy_file_key())}
+    if _legacy_file_key():
+        return {"source": "legacy-plaintext",
+                "backend": ("unreachable" if credentials_mod.available()
+                            else "missing"),
+                "migrated": False}
+    return {"source": "missing",
+            "backend": ("available" if credentials_mod.available()
+                        else "missing"),
+            "migrated": True}
+
+
 def get_api_key() -> Optional[str]:
-    """Get the Gemini API key, preferring config file then environment variable."""
-    config = load_config()
-    return config.get("api_key") or os.environ.get("GEMINI_API_KEY")
+    """Get the Gemini API key: secure store, then legacy plaintext
+    (migrating it when possible), then GEMINI_API_KEY.
+
+    A legacy fallback return keeps the assistant working when the
+    secure backend is broken; credential_status() reports that state
+    honestly instead of pretending it is secure.
+    """
+    from cat_talker import credentials as credentials_mod
+    stored = credentials_mod.get_key()
+    if stored:
+        if _legacy_file_key():
+            _scrub_legacy_file_key()
+        return stored
+    legacy = _legacy_file_key()
+    if legacy:
+        status, _ = migrate_legacy_api_key()
+        if status == "migrated":
+            return credentials_mod.get_key() or legacy
+        logger.debug("secure store unavailable; using legacy config key")
+        return legacy
+    return os.environ.get("GEMINI_API_KEY")
 
 
 def is_api_key_configured() -> bool:
-    """Whether an API key is available (config file or environment)."""
+    """Whether an API key is available (secure store, legacy, or env)."""
     return bool(get_api_key())
 
 
 def set_api_key(key: str) -> str:
-    """Store a replacement API key in the config file. Never logs it."""
+    """Store a replacement API key in the secure backend. Never logs it.
+
+    Refuses to write plaintext anywhere: a failed secure write returns
+    an error and persists nothing.
+    """
+    from cat_talker import credentials as credentials_mod
     if not isinstance(key, str) or not key.strip():
         return "Error: API key must not be empty."
-    config = load_config()
-    config["api_key"] = key.strip()
-    result = save_config(config)
-    if result.startswith("Configuration saved"):
-        return "API key updated."
-    return result
+    ok, message = credentials_mod.save_key(key.strip())
+    if not ok:
+        return message
+    _scrub_legacy_file_key()
+    return "API key stored securely."
 
 
 def clear_api_key() -> str:
-    """Remove the API key stored in the config file (env var untouched)."""
-    config = load_config()
-    config["api_key"] = ""
-    result = save_config(config)
-    if result.startswith("Configuration saved"):
+    """Remove the API key from the secure backend and any legacy copy."""
+    from cat_talker import credentials as credentials_mod
+    had_legacy = bool(_legacy_file_key())
+    if had_legacy:
+        _scrub_legacy_file_key()
+    ok, message = credentials_mod.delete_key()
+    if ok:
         return "Stored API key removed."
-    return result
+    if had_legacy:
+        return ("Error: legacy plaintext key removed, but " +
+                message[0].lower() + message[1:])
+    return message
 
 
 def get_preferred_monitor() -> str:
