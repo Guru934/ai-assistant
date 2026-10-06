@@ -1,16 +1,16 @@
 # AI Assistant — current verified project state
 
-Checkpoint: **`99ab236`** — *docs: record live desktop acceptance*
-(follows `343774c` *docs: sync reminder milestone status*,
-`f4514ae` *feat: clarify reminder tool contract* — the latest
-code/test checkpoint, automated suite 580 passed — `ddcf750`,
-`47039dd`, `dfac8f0`, `dc95c62`, `ae92f80` — full chain back through
-`b72d466`, `ec7276f` and `5ee950c`). Working tree matches the
-checkpoint except untracked `.vscode/` (IDE state, not project
-source); everything below is implemented, unit-tested (580 passed via
-`./.venv/bin/python -m pytest -q` at the `f4514ae` code checkpoint,
-plus human-verified live-desktop acceptance recorded in `99ab236`),
-and committed. No hardware,
+Checkpoint: **`9e32be0`** — *feat: securely hand Gemini credentials
+to Goose* (the latest code/test checkpoint, automated suite
+600 passed; follows `cc08eeb` *docs: finalize reminder acceptance
+notes*, `ba6acce` *feat: add optional Goose coding worker*,
+`f4514ae`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80` —
+full chain back through `b72d466`, `ec7276f` and `5ee950c`).
+Working tree matches the checkpoint except untracked `.vscode/`
+(IDE state, not project source); everything below is implemented,
+unit-tested (600 passed via `./.venv/bin/python -m pytest -q` at the
+`9e32be0` code checkpoint, plus human-verified live-desktop
+acceptance), and committed. No hardware,
 network, speakers, or credentials needed for the suite (fakes for
 Live sessions, audio, vision, Qt offscreen, playerctl, subprocess,
 network).
@@ -92,7 +92,16 @@ network).
   `verification` ∈ not_run / worker_reported_* /
   independently_verified_*): Chibi reports "Worker completed;
   verification was not available." unless independently verified, and
-  never says "All tests passed" without verified basis.
+  never says "All tests passed" without verified basis. Backends:
+  OpenCode is the default; Goose 1.53.0 is an explicit opt-in second
+  backend (`CAT_TALKER_CODER_BACKEND=goose`) behind the same
+  `WorkerProvider` abstraction, validation, timeout, output bounds,
+  verification, and approval flow. When selected, Goose runs headless
+  (`run --no-session -q --max-turns 25 -t`, Google provider, model
+  `gemini-3.8-flash` by default) with Chibi's secure Gemini key handed
+  to the Goose child only as `GOOGLE_API_KEY` (`GEMINI_API_KEY`
+  removed); no second credential is stored, nothing is configured
+  automatically, and Goose is not sandboxed.
 - Computer-use grounding + multi-step context: every inspected frame
   states its `frame_seq`; `click_screen` takes the current frame's
   `frame_seq` and refuses stale coordinates (max 2 alternate retries,
@@ -169,6 +178,11 @@ network).
     the real desktop; reminder firing itself was validated through
     the real notification daemon/production path (verified at the
     store/scheduler/tool level plus a headless production-path run).
+  - **Goose/Cloud Gemini is quota/cost-gated** (free-tier requests
+    were exhausted during validation; no billing touched), stays
+    opt-in with OpenCode remaining the default, and its large-model
+    multi-file capability still needs a real post-quota production
+    task. Neither backend has an OS-level sandbox.
 - Future work (acceptance phase, not architecture rewrites):
   end-to-end real-world acceptance testing, documentation upkeep,
   UX polish from real usage, remaining audio/echo edge cases,

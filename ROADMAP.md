@@ -1,4 +1,4 @@
-Completed (current GitHub checkpoint `99ab236` docs: record live desktop acceptance; latest code/test checkpoint `f4514ae` with 580 automated tests passing; follows `343774c`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
+Completed (current GitHub checkpoint `9e32be0` with 600 automated tests passing; follows `cc08eeb`, `ba6acce`, `f4514ae`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
 ├── Core voice assistant
 ├── Gemini Live lifecycle
 ├── OS controls
@@ -42,10 +42,12 @@ Completed (current GitHub checkpoint `99ab236` docs: record live desktop accepta
 │   notification delivery only; sleep/wake-independent; clean
 │   shutdown; persistent cancellation; explicit-request model
 │   contract)
-└── Spoken live-desktop acceptance, human-verified PASS (workspace 5/6
-    switching, app-open auto-hide, F1 hide/show round-trip with
-    usable session after restore, F2 wake/listen, F3 quit;
-    workspace changes do not auto-hide; no defects)
+├── Spoken live-desktop acceptance, human-verified PASS (workspace 5/6
+│   switching, app-open auto-hide, F1 hide/show round-trip with
+│   usable session after restore, F2 wake/listen, F3 quit;
+│   workspace changes do not auto-hide; no defects)
+└── Goose opt-in coding backend (same WorkerProvider abstraction;
+    secure credential handoff; validated model gemini-3.8-flash)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── End-to-end acceptance testing (live mic across wake cycles)

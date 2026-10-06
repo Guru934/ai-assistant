@@ -54,6 +54,11 @@ independently verified results.
   assistant paths denied). Worker claims and verified facts stay
   separate: results are reported as verified only after independent
   local checks; otherwise "verification was not available."
+  OpenCode is the default backend; Goose is an explicit opt-in
+  second backend behind the same provider abstraction
+  (`CAT_TALKER_CODER_BACKEND=goose`), running headless with Chibi's
+  secure Gemini key handed to the Goose child only as
+  `GOOGLE_API_KEY`. Neither backend is sandboxed.
 - **Sleep/wake with 60 s meaningful-idle timeout** — starts SLEEPING (no
   Live session, no mic forwarding). Waking opens one fresh session;
   sleeping closes it cleanly with no reconnect loop. Only accepted
@@ -264,23 +269,23 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-580 passed, no hardware or network needed (fakes for Live sessions,
+600 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
 computer-use grounding + stale-frame protection + multi-step context,
 echo DSP, sleep/wake + F1/F2/F3 control, single-instance launch,
 window lifecycle, shutdown, voice config (VAD/hints/guard), wake
 word, tray + bubble UI, settings, secure credentials + migration,
-reminders (store, scheduler, contract), media watcher, web info, Weather, Memory, TTS, assistant text
+reminders (store, scheduler, contract), Goose opt-in backend +
+credential handoff, media watcher, web info, Weather, Memory, TTS, assistant text
 stream, coding worker + verification, workspace switching
 (user-facing 1–6), auto-hide visibility behavior, diagnostics, and
 packaging.
 
-Current state: automated suite 580 passed at the `f4514ae` code
-checkpoint; current GitHub/documentation checkpoint is `99ab236`,
-which additionally records the live desktop acceptance subsequently
+Current state: automated suite 600 passed at the `9e32be0` code
+checkpoint (current GitHub main); live desktop acceptance
 human-verified PASS (workspace 5/6, app-open auto-hide, F1 restore,
-F2 wake/listen, F3 quit; no defects) — separate from the automated
-suite. Next phase is product acceptance and real-world validation
-(see `ROADMAP.md`). No `AGENTS.md`
+F2 wake/listen, F3 quit; no defects) — recorded separately from the
+automated suite. Next phase is product acceptance and real-world
+validation (see `ROADMAP.md`). No `AGENTS.md`
 exists in this repo; engineering rules live with the maintainer.

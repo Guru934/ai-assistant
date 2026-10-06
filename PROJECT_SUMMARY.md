@@ -48,7 +48,7 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Settings Persistence** - API key, preferred monitor, auto-reconnect, voice approval saved to `~/.config/cat-talker/config.json`
 - **Modular Design** - Cleanly separated audio, vision, config, logging, and AI modules
 - **Structured Logging** - All modules use structured logging (DEBUG/INFO/WARNING/ERROR)
-- **Unit Tests** - 580 tests covering lifecycle, audio, sleep/wake,
+- **Unit Tests** - 600 tests covering lifecycle, audio, sleep/wake,
   control/launch, vision, tools, grounding + stale-frame protection +
   multi-step context, web info, Weather, Memory, TTS, assistant text
   stream, coding worker + verification, reminders (store, scheduler,
@@ -138,6 +138,10 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
   JSON store + deterministic scheduler + notification delivery;
   model contract: never invent, read-only list, cancel existing
   only, ask rather than guess)
+- **Goose opt-in backend** (OpenCode default unchanged; Goose behind
+  the same provider abstraction with secure `GOOGLE_API_KEY`-only
+  handoff; validated model `gemini-3.8-flash`; T1/T2 benchmark tasks
+  independently verified PASS, further runs quota-blocked)
 
 ## Project Structure
 ```
@@ -202,7 +206,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 ## Test Results
 ```bash
 ./.venv/bin/python -m pytest -q
-# 580 passed — no hardware, network, speakers, or credentials needed
+# 600 passed — no hardware, network, speakers, or credentials needed
 # (fakes for Live sessions, audio, vision, Qt offscreen, playerctl,
 # subprocess, network). See README "How to run tests" for coverage.
 ```
@@ -218,7 +222,9 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
   `wake_word_enabled: true`; otherwise F2 wakes); Hyprland needed
   for global keys; needs network + valid Gemini API key.
 - **Coding worker has no OS-level sandbox**; worker-reported tests are
-  claims until independently verified.
+  claims until independently verified. Goose/Cloud Gemini is
+  quota/cost-gated (free-tier exhausted during validation) and its
+  multi-file capability still needs a post-quota production task.
 - **`read_aloud` needs `espeak-ng`**; Weather needs network; web
   search/fetch are bounded best-effort; English/Hindi responses only.
 - **Reminders fire only while the Chibi process runs**; once/daily
@@ -246,10 +252,10 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ---
 
-*Last verified: 2026-10-06 — automated suite 580 passing at the
-`f4514ae` code checkpoint; current GitHub/documentation checkpoint
-`99ab236`, which additionally records the live-desktop acceptance
-subsequently human-verified PASS (separate from the automated suite).
+*Last verified: 2026-10-06 — automated suite 600 passing at the
+`9e32be0` code checkpoint (current GitHub main), which additionally
+records the live-desktop acceptance human-verified PASS (separate
+from the automated suite).
 Live voice-command end-to-end for workspace 5/6 and the auto-hide
 round-trip is human-verified PASS on the live desktop (workspace 5/6,
 app-open auto-hide, F1 restore, F2 wake/listen, F3 quit; no defects),
