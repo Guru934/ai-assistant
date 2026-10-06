@@ -227,3 +227,36 @@ def test_risky_approval_unchanged_for_input_tools():
         assert "PAUSED FOR SAFETY" in out, out
     finally:
         tools_mod.PENDING_RISKY_ACTION = None
+
+
+# ---------------------------------------------------------------------------
+# Persistent-access advisory (reboot-proof input-group step)
+# ---------------------------------------------------------------------------
+
+def test_input_group_membership_states(monkeypatch):
+    import grp
+    import cat_talker.ydotool_health as health_mod
+
+    class _Group:
+        gr_gid = 992
+
+    monkeypatch.setattr(grp, "getgrnam", lambda name: _Group())
+    monkeypatch.setattr(health_mod.os, "getgroups", lambda: [992, 1000])
+    assert health_mod.user_in_input_group() is True
+    monkeypatch.setattr(health_mod.os, "getgroups", lambda: [1000])
+    assert health_mod.user_in_input_group() is False
+    monkeypatch.setattr(grp, "getgrnam", lambda name: (_ for _ in ()).throw(
+        KeyError("no such group")))
+    assert health_mod.user_in_input_group() is None
+
+
+def test_persistent_hint_only_when_missing(monkeypatch):
+    import cat_talker.ydotool_health as health_mod
+    monkeypatch.setattr(health_mod, "user_in_input_group", lambda: True)
+    assert health_mod.persistent_access_hint() == ""
+    monkeypatch.setattr(health_mod, "user_in_input_group", lambda: None)
+    assert health_mod.persistent_access_hint() == ""
+    monkeypatch.setattr(health_mod, "user_in_input_group", lambda: False)
+    hint = health_mod.persistent_access_hint()
+    assert "usermod -aG input" in hint, hint
+    assert "sudo" in hint and "log out" in hint

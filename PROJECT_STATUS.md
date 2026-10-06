@@ -91,7 +91,9 @@ playerctl, subprocess, network).
      `bin/assistant-control ydotool-status` reports
      healthy/missing/stopped/unusable/permission without performing
      input; `bin/assistant-ydotool-setup` enables the packaged user
-     service (explicit, user-level, never sudo).
+     service (explicit, user-level, never sudo). One-time `sudo usermod
+     -aG input $USER` + re-login makes startup reboot-proof (without
+     it, the boot-time unit races logind's uaccess ACL and fails).
   - **No voice wake-word while sleeping (F2 required);** Hyprland needed
     for global keys; needs network + valid Gemini API key.
   - **The coding worker has NO OS-level sandbox.** The boundary is

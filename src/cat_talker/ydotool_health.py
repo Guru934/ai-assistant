@@ -175,3 +175,34 @@ def format_ydotool_status():
     if health.hint:
         lines.append(f"hint: {health.hint}")
     return ("\n".join(lines), 0 if health.status == HEALTHY else 1)
+
+
+def user_in_input_group():
+    """True/False whether this user holds the input group; None when the
+    group database cannot answer. Pure read (grp/getgroups), no I/O side
+    effects, no privilege needed."""
+    try:
+        import grp
+        want = grp.getgrnam("input").gr_gid
+        return want in os.getgroups()
+    except Exception:
+        return None
+
+
+def persistent_access_hint() -> str:
+    """One-time host step for reboot-proof ydotool, or "".
+
+    Background: the packaged user unit starts at boot, but logind grants
+    /dev/uinput access (uaccess ACL) only once a graphical session is
+    active - the daemon fails 5x in the first second and systemd gives up
+    for the whole boot (start-limit-hit). Membership in the input group
+    (the upstream ydotool recommendation, see /usr/lib/udev/rules.d/
+    80-uinput.rules: GROUP="input" MODE="0660") makes access static:
+    no race, no session dependence, no re-login sensitivity afterwards.
+    """
+    if user_in_input_group() is False:
+        return ("For reliable startup across reboots (no manual start): "
+                "run once `sudo usermod -aG input $USER`, then log out "
+                "and back in. Until then, `bin/assistant-ydotool-setup` "
+                "starts the daemon for the current session only.")
+    return ""

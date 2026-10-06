@@ -24,6 +24,7 @@ from cat_talker.ydotool_health import (  # noqa: E402
     SERVICE_NAME,
     check_ydotool_health,
     format_ydotool_status,
+    persistent_access_hint,
 )
 
 
@@ -50,6 +51,9 @@ def main():
         return 1
     text, status_code = format_ydotool_status()
     print(text)
+    hint = persistent_access_hint()
+    if hint:
+        print(f"note: {hint}")
     if status_code != 0:
         print("setup ran but the backend is still unhealthy; "
               "see: journalctl --user -u ydotool.service")

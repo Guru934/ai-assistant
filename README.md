@@ -120,7 +120,10 @@ Input backend: computer-use injection uses the packaged `ydotool.service`
 user unit (`/usr/bin/ydotoold`, persists across logins while enabled with
 systemd lingering). Check it with `bin/assistant-control ydotool-status`;
 enable/start it explicitly with `bin/assistant-ydotool-setup` (user level
-only, never sudo). Click/type/key failures name the exact cause
+only, never sudo). One-time host step for reboot-proof startup: `sudo
+usermod -aG input $USER`, then log out/in once (the user unit otherwise
+races logind's uaccess grant at boot and systemd gives up for the
+boot). Click/type/key failures name the exact cause
 (ydotool missing, daemon stopped, permission/uinput problem).
 
 Configuration: a Gemini API key via `GEMINI_API_KEY` env or
