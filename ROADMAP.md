@@ -1,4 +1,4 @@
-Completed (all implemented and committed as of `f4514ae`, follows `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
+Completed (current GitHub checkpoint `99ab236` docs: record live desktop acceptance; latest code/test checkpoint `f4514ae` with 580 automated tests passing; follows `343774c`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
 ├── Core voice assistant
 ├── Gemini Live lifecycle
 ├── OS controls

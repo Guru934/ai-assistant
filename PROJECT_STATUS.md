@@ -1,15 +1,16 @@
 # AI Assistant — current verified project state
 
-Checkpoint: **`f4514ae`** — *feat: clarify reminder tool contract*
-(follows `ddcf750` *feat: add deterministic local reminders*,
-`47039dd` *test: make bubble geometry assertion window-relative*,
-`dfac8f0` *docs: sync project status after ydotool and UX work*,
-`dc95c62` *Make ydotool runtime setup reliable*, `ae92f80` *Fix tray
-status and assistant UI* — full chain back through `b72d466`,
-`ec7276f` and `5ee950c`). Working tree matches the
+Checkpoint: **`99ab236`** — *docs: record live desktop acceptance*
+(follows `343774c` *docs: sync reminder milestone status*,
+`f4514ae` *feat: clarify reminder tool contract* — the latest
+code/test checkpoint, automated suite 580 passed — `ddcf750`,
+`47039dd`, `dfac8f0`, `dc95c62`, `ae92f80` — full chain back through
+`b72d466`, `ec7276f` and `5ee950c`). Working tree matches the
 checkpoint except untracked `.vscode/` (IDE state, not project
 source); everything below is implemented, unit-tested (580 passed via
-`./.venv/bin/python -m pytest -q`), and committed. No hardware,
+`./.venv/bin/python -m pytest -q` at the `f4514ae` code checkpoint,
+plus human-verified live-desktop acceptance recorded in `99ab236`),
+and committed. No hardware,
 network, speakers, or credentials needed for the suite (fakes for
 Live sessions, audio, vision, Qt offscreen, playerctl, subprocess,
 network).

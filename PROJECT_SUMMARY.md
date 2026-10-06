@@ -246,7 +246,10 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ---
 
-*Last verified: 2026-10-06 at checkpoint `f4514ae` (580 tests passing).
+*Last verified: 2026-10-06 — automated suite 580 passing at the
+`f4514ae` code checkpoint; current GitHub/documentation checkpoint
+`99ab236`, which additionally records the live-desktop acceptance
+subsequently human-verified PASS (separate from the automated suite).
 Live voice-command end-to-end for workspace 5/6 and the auto-hide
 round-trip is human-verified PASS on the live desktop (workspace 5/6,
 app-open auto-hide, F1 restore, F2 wake/listen, F3 quit; no defects),

@@ -273,6 +273,11 @@ stream, coding worker + verification, workspace switching
 (user-facing 1–6), auto-hide visibility behavior, diagnostics, and
 packaging.
 
-Current state: checkpoint `f4514ae`, all green; next phase is product
-acceptance and real-world validation (see `ROADMAP.md`). No `AGENTS.md`
+Current state: automated suite 580 passed at the `f4514ae` code
+checkpoint; current GitHub/documentation checkpoint is `99ab236`,
+which additionally records the live desktop acceptance subsequently
+human-verified PASS (workspace 5/6, app-open auto-hide, F1 restore,
+F2 wake/listen, F3 quit; no defects) — separate from the automated
+suite. Next phase is product acceptance and real-world validation
+(see `ROADMAP.md`). No `AGENTS.md`
 exists in this repo; engineering rules live with the maintainer.
