@@ -24,6 +24,7 @@ from cat_talker.main import (
     BUBBLE_AVATAR_SCALE,
     BUBBLE_TEXT_MAX_H,
     BUBBLE_TEXT_MAX_W,
+    BUBBLE_TOP,
     count_overlay_windows,
     get_overlay_window,
 )
@@ -55,7 +56,12 @@ def test_short_text_box_inside_window():
     window._on_bubble(SHORT)
     assert window.bubble_text == SHORT
     x, y, w, h = window._bubble_box()
-    assert (x, y) == (12, 8)
+    # Centered full-width box by design: assert the centering contract,
+    # not a magic constant. The overlay is a process-global singleton
+    # whose width other suites may leave non-320 (resize-then-read
+    # races), so (12, 8) only holds at exactly 320px wide.
+    assert w == BUBBLE_TEXT_MAX_W + 28
+    assert (x, y) == ((window.width() - w) // 2, BUBBLE_TOP)
     assert 0 < w <= BUBBLE_TEXT_MAX_W + 28
     assert 0 < h <= 140
     # Fully inside the renderable window: no negative/clipped coords.
