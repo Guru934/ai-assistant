@@ -59,9 +59,19 @@ BACKEND_OPENCODE = "opencode"
 BACKEND_GOOSE = "goose"
 BACKENDS = (BACKEND_OPENCODE, BACKEND_GOOSE)
 GOOSE_CLI_BIN = "goose"
+GOOSE_PROVIDER = "google"
+# Validated Goose cloud model (real headless benchmark). Single source:
+# CAT_TALKER_GOOSE_MODEL overrides; never hard-code elsewhere.
+GOOSE_DEFAULT_MODEL = "gemini-3.8-flash"
 # Bounded agent iterations per task (verified `goose run --help` flag;
 # the subprocess timeout below remains the hard wall).
 GOOSE_MAX_TURNS = 25
+
+
+def resolve_goose_model() -> str:
+    """Configured Goose model, defaulting to the validated one."""
+    configured = os.environ.get("CAT_TALKER_GOOSE_MODEL", "").strip()
+    return configured or GOOSE_DEFAULT_MODEL
 
 
 def _protected_roots() -> list:
@@ -478,6 +488,12 @@ class SubprocessWorkerProvider(WorkerProvider):
         return ([resolved] + list(self.extra_args)
                 + ["--dir", req.workspace, prompt])
 
+    def _child_env(self, req: WorkerRequest) -> dict | None:
+        """Environment for the worker process. None inherits the
+        current environment (OpenCode default). Subclasses override
+        to isolate credentials without touching shared logic."""
+        return None
+
     def run(self, request: WorkerRequest) -> WorkerResult:
         req = request.validated()
         resolved = shutil.which(self.binary)
@@ -493,7 +509,8 @@ class SubprocessWorkerProvider(WorkerProvider):
             proc = subprocess.Popen(
                 argv, cwd=req.workspace,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, start_new_session=True)
+                text=True, start_new_session=True,
+                env=self._child_env(req))
         except FileNotFoundError as e:
             return WorkerResult(ok=False, error=f"Coding worker missing: {e}")
         except OSError as e:
@@ -547,6 +564,7 @@ class GooseWorkerProvider(SubprocessWorkerProvider):
             self.max_turns = max(1, min(100, int(max_turns)))
         except (TypeError, ValueError):
             self.max_turns = GOOSE_MAX_TURNS
+        self.goose_model = resolve_goose_model()
 
     def _build_argv(self, resolved: str, req: WorkerRequest) -> list:
         prompt = req.task
@@ -554,8 +572,35 @@ class GooseWorkerProvider(SubprocessWorkerProvider):
             prompt += "\nConstraints: " + req.constraints
         # No --dir equivalent exists (verified `goose run --help`):
         # cwd=workspace (set by the shared run path) is the scope.
+        # Credentials never appear here (see _child_env).
         return [resolved, "run", "--no-session", "-q",
-                "--max-turns", str(self.max_turns), "-t", prompt]
+                "--max-turns", str(self.max_turns),
+                "--provider", GOOSE_PROVIDER,
+                "--model", self.goose_model,
+                "-t", prompt]
+
+    def _child_env(self, req: WorkerRequest) -> dict:
+        """Hand Chibi's secure Gemini key to Goose as GOOGLE_API_KEY.
+
+        Reads the established credential path (secure store, then
+        legacy, then env) and rebuilds the child environment: the
+        Chibi-side GEMINI_API_KEY name is removed so only the
+        Google-provider name reaches Goose. Never logged, never in
+        argv, never persisted. Raises ValueError (honest failure
+        before launch) when no key exists — no fallback, no Ollama.
+        """
+        from cat_talker import config as config_mod
+        key = config_mod.get_api_key()
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError(
+                "Coding error: no Gemini API key available for the "
+                "Goose backend (Google provider needs GOOGLE_API_KEY). "
+                "Add a key via Settings or GEMINI_API_KEY; "
+                "Goose is not configured automatically.")
+        child = dict(os.environ)
+        child.pop("GEMINI_API_KEY", None)
+        child["GOOGLE_API_KEY"] = key.strip()
+        return child
 
 
 def _kill_process_group(proc):

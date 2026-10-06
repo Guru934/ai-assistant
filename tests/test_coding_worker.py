@@ -37,6 +37,14 @@ def _no_real_sockets(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", _boom)
 
 
+@pytest.fixture(autouse=True)
+def _fake_chibi_key(monkeypatch):
+    # No test may touch the real secure credential store: the Goose
+    # handoff always reads this fake key instead.
+    monkeypatch.setattr("cat_talker.config.get_api_key",
+                        lambda: "fake-test-key")
+
+
 @pytest.fixture
 def _clean_pending():
     import cat_talker.tools as tools_mod
@@ -728,6 +736,8 @@ def test_goose_argv_exact_shape(tmp_path, monkeypatch):
     assert result.ok is True
     assert seen["argv"] == ["/home/guru/.local/bin/goose", "run",
                             "--no-session", "-q", "--max-turns", "25",
+                            "--provider", "google",
+                            "--model", "gemini-3.8-flash",
                             "-t", "fix bug"]
     assert "shell" not in seen["kwargs"]
     assert seen["kwargs"]["start_new_session"] is True
@@ -858,3 +868,66 @@ def test_opencode_argv_unchanged_regression(tmp_path, monkeypatch):
     assert seen["argv"] == ["/usr/bin/opencode", "run",
                             "--dir", os.path.realpath(str(tmp_path)),
                             "fix bug"]
+
+
+# ─── Goose credential handoff (secure store → GOOGLE_API_KEY only) ──
+
+def test_goose_model_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_GOOSE_MODEL", "gemini-9.9-ultra")
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    GooseWorkerProvider().run(build_request(str(tmp_path), "fix bug"))
+    assert "--model" in seen["argv"]
+    assert seen["argv"][seen["argv"].index("--model") + 1] == \
+        "gemini-9.9-ultra"
+
+
+def test_goose_default_model_is_validated_flash(tmp_path, monkeypatch):
+    monkeypatch.delenv("CAT_TALKER_GOOSE_MODEL", raising=False)
+    assert cw.resolve_goose_model() == "gemini-3.8-flash"
+
+
+def test_goose_child_env_isolates_credential(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "chibi-real-key-must-not-pass")
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    GooseWorkerProvider().run(build_request(str(tmp_path), "fix bug"))
+    child = seen["kwargs"]["env"]
+    assert isinstance(child, dict)
+    assert child["GOOGLE_API_KEY"] == "fake-test-key"
+    assert "GEMINI_API_KEY" not in child
+    # Non-secret runtime context is preserved.
+    assert child["PATH"] == os.environ["PATH"]
+
+
+def test_goose_key_never_in_argv(tmp_path, monkeypatch):
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    GooseWorkerProvider().run(build_request(str(tmp_path), "fix bug"))
+    for part in seen["argv"]:
+        assert "fake-test-key" not in part
+    assert "--provider" in seen["argv"] and "--model" in seen["argv"]
+
+
+def test_goose_missing_key_fails_before_launch(tmp_path, monkeypatch):
+    import cat_talker.config as config_mod
+    monkeypatch.setattr(config_mod, "get_api_key", lambda: "")
+    started = []
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda _: "/home/guru/.local/bin/goose")
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: started.append((a, k)))
+    import cat_talker.coding_worker as cw_mod
+    result = cw_mod.delegate(
+        build_request(str(tmp_path), "fix bug"),
+        provider=GooseWorkerProvider())
+    assert "Coding task FAILED" in result
+    assert "no Gemini API key" in result
+    assert started == [], "goose launched without a credential"
+
+
+def test_opencode_env_passthrough_unchanged(tmp_path, monkeypatch):
+    seen = _mock_popen(monkeypatch)
+    result = SubprocessWorkerProvider().run(
+        build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert seen["kwargs"]["env"] is None
+    assert "--provider" not in seen["argv"]
+    assert "--model" not in seen["argv"]
