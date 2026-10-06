@@ -287,7 +287,7 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-600 passed, no hardware or network needed (fakes for Live sessions,
+603 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
 computer-use grounding + stale-frame protection + multi-step context,
@@ -300,7 +300,7 @@ stream, coding worker + verification, workspace switching
 (user-facing 1–6), auto-hide visibility behavior, diagnostics, and
 packaging.
 
-Current state: automated suite 600 passed at the `9e32be0` code
+Current state: automated suite 603 passed at the `9b2928d` code
 checkpoint (current GitHub main); live desktop acceptance
 human-verified PASS (workspace 5/6, app-open auto-hide, F1 restore,
 F2 wake/listen, F3 quit; no defects) — recorded separately from the
