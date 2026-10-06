@@ -22,7 +22,13 @@ independently verified results.
   volume, brightness, workspaces, media (`playerctl`), notifications,
   YouTube search-and-play, and preferences. Risky actions
   (`click_screen`, `type_text`, `press_key`, `run_coding_task`) require
-  spoken "yes" approval first.
+  spoken "yes" approval first. Clicks are visually grounded: every
+  inspected frame carries a `frame_seq` number, `click_screen` must be
+  given the current frame's `frame_seq`, and clicks grounded on older
+  frames are refused as stale (max 2 alternate retries, then the
+  assistant asks the user). Multi-step computer-use runs keep a
+  `ComputerUseContext` (geometry + frame/action sequences) across
+  inspect/click/verify turns instead of re-deriving state each call.
 - **Local date/time** — `get_current_datetime` answers "what time is it?",
   "what's today's date?", "what day is today?" from Python's system clock
   (deterministic, timezone-aware, standard library only, no network).
@@ -57,6 +63,26 @@ independently verified results.
   wake mechanism; detection failure is harmless.
 - **Single overlay window** — exactly one `RadialVisualizerWindow` per
   process, enforced by a singleton factory; hide/show reuses it.
+- **Readable speech bubble** — caption text wraps inside a full-width
+  top zone (never clipped); the avatar shifts down and shrinks while
+  the bubble shows so the two never overlap.
+- **System tray** — tray icon with live status row (sleeping/awake +
+  overlay visibility, refreshed on every menu open), Show window,
+  Wake, Sleep, Settings, a read-only ydotool status dialog, and Quit.
+- **Settings UI** — in-app panel (tray Settings or spoken request) for
+  API key (saved to the OS keyring), monitor, voice, and approvals.
+- **Secure API-key storage** — key lives in the SecretService keyring
+  via `keyring`, never plaintext; a legacy `api_key` in
+  `~/.config/cat-talker/config.json` is auto-migrated on startup and
+  the file copy scrubbed. Precedence: secure store, then legacy
+  (migrating), then `GEMINI_API_KEY`.
+- **Optional local wake word** — "Hey Jarvis" via openwakeword, off by
+  default, fully offline (no audio leaves the PC, no Gemini session
+  while sleeping); wakes through the same path as F2.
+- **Assistant text stream** — TEXT is assembled from
+  output-audio-transcription events alongside AUDIO (the API rejects an
+  explicit AUDIO+TEXT modality pair for this model), so replies are
+  available as text without changing the audio path.
 - **Graceful shutdown** — session, audio, and Qt all unwind cleanly.
 
 ## High-level architecture
@@ -101,6 +127,11 @@ GeminiDesktopAgent ── Gemini Live session (connect only when awake)
   ├─ speech.py     standalone TTS boundary (local engine, replaceable)
   ├─ media_watcher.py  read-only MPRIS Playing-edge watcher
   ├─ coding_worker.py  delegated execution + verification boundary
+  ├─ ydotool_health.py read-only ydotool backend health + setup hints
+  ├─ tray.py         system-tray icon/menu (live status, ydotool dialog)
+  ├─ settings.py     in-app settings panel (key, monitor, voice)
+  ├─ credentials.py  SecretService keyring API-key storage + migration
+  ├─ wakeword.py     optional offline openwakeword detection
   ├─ sleep.py      sleep/wake state machine + idle policy
   └─ control.py    local control-socket server (runtime-dir locking)
 ```
@@ -126,9 +157,12 @@ races logind's uaccess grant at boot and systemd gives up for the
 boot). Click/type/key failures name the exact cause
 (ydotool missing, daemon stopped, permission/uinput problem).
 
-Configuration: a Gemini API key via `GEMINI_API_KEY` env or
-`~/.config/cat-talker/config.json` (`api_key`). Without a key the app
-exits with an error dialog instead of starting broken.
+Configuration: a Gemini API key via `GEMINI_API_KEY` env, the Settings
+panel, or `bin/assistant-control` setup — it is stored in the OS
+SecretService keyring, never plaintext. A legacy `api_key` in
+`~/.config/cat-talker/config.json` is migrated automatically and
+scrubbed. Without any key the app exits with an error dialog instead
+of starting broken.
 
 ## How to run it
 
@@ -192,8 +226,10 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 - Echo suppression/audio isolation is improved but defensive, not a
   perfect guarantee; live-mic validation across wake cycles is still
   real-world-pending.
-- Generic visual clicking is best-effort (`ydotoold` + `input` group).
-- No voice wake-word while sleeping (F2 required); Hyprland needed for
+- Generic visual clicking is best-effort (`ydotoold` + `input` group,
+  frame-grounded with stale refusal).
+- The optional wake word needs `openwakeword` installed and
+  `wake_word_enabled: true`; otherwise F2 wakes. Hyprland needed for
   global keys; needs network + a valid Gemini key.
 - Coding worker has no OS sandbox (see above); worker-reported tests
   are claims until independently verified.
@@ -207,15 +243,18 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-409 passed, no hardware or network needed (fakes for Live sessions,
+562 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
-computer-use grounding, echo DSP, sleep/wake + F1/F2/F3 control,
-single-instance launch, window lifecycle, shutdown, voice config
-(VAD/hints/guard), media watcher, web info, Weather, Memory, TTS,
-coding worker + verification, workspace switching (user-facing 1–6),
-auto-hide visibility behavior, diagnostics, and packaging.
+computer-use grounding + stale-frame protection + multi-step context,
+echo DSP, sleep/wake + F1/F2/F3 control, single-instance launch,
+window lifecycle, shutdown, voice config (VAD/hints/guard), wake
+word, tray + bubble UI, settings, secure credentials + migration,
+media watcher, web info, Weather, Memory, TTS, assistant text
+stream, coding worker + verification, workspace switching
+(user-facing 1–6), auto-hide visibility behavior, diagnostics, and
+packaging.
 
-Current state: checkpoint `ec7276f`, all green; next phase is product
+Current state: checkpoint `dc95c62`, all green; next phase is product
 acceptance and real-world validation (see `ROADMAP.md`). No `AGENTS.md`
 exists in this repo; engineering rules live with the maintainer.

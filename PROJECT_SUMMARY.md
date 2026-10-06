@@ -8,7 +8,12 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 ### Core Components
 | File | Purpose |
 |------|---------|
-| `src/cat_talker/main.py` | PyQt6 floating UI with animated cat avatar + transcription display + history logger |
+| `src/cat_talker/main.py` | PyQt6 floating UI with animated cat avatar + readable wrapping speech bubble + transcription display + history logger |
+| `src/cat_talker/tray.py` | System-tray icon/menu: live status row, Show/Wake/Sleep/Settings, read-only ydotool status dialog, Quit |
+| `src/cat_talker/settings.py` | In-app settings panel (API key → OS keyring, monitor, voice, approvals) |
+| `src/cat_talker/credentials.py` | SecretService keyring API-key storage + legacy plaintext migration/scrub |
+| `src/cat_talker/wakeword.py` | Optional offline openwakeword detection ("Hey Jarvis", off by default) |
+| `src/cat_talker/ydotool_health.py` | Read-only ydotool backend health states + setup hints |
 | `src/cat_talker/agent.py` | Gemini Live orchestration, combining modular audio, vision, and tools. |
 | `src/cat_talker/audio.py` | Audio capture/playback using PyAudio, and volume tracking |
 | `src/cat_talker/vision.py` | Screen capture using `grim` (Wayland native) or `mss` (X11) with multi-monitor support |
@@ -42,10 +47,13 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Settings Persistence** - API key, preferred monitor, auto-reconnect, voice approval saved to `~/.config/cat-talker/config.json`
 - **Modular Design** - Cleanly separated audio, vision, config, logging, and AI modules
 - **Structured Logging** - All modules use structured logging (DEBUG/INFO/WARNING/ERROR)
-- **Unit Tests** - 409 tests covering lifecycle, audio, sleep/wake,
-  control/launch, vision, tools, web info, Weather, Memory, TTS, coding
-  worker + verification, workspace switching (1–6), auto-hide
-  visibility, diagnostics (see "Test Results" below)
+- **Unit Tests** - 562 tests covering lifecycle, audio, sleep/wake,
+  control/launch, vision, tools, grounding + stale-frame protection +
+  multi-step context, web info, Weather, Memory, TTS, assistant text
+  stream, coding worker + verification, workspace switching (1–6),
+  auto-hide visibility, tray + bubble UI, wake word, settings, secure
+  credentials + migration, ydotool health/setup, diagnostics (see
+  "Test Results" below)
 
 ### ✅ OS Tools (Auto-Execute - No Approval)
 | Tool | Description |
@@ -80,7 +88,7 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 ### ⚠️ Risky Tools (Voice Confirmation Required)
 | Tool | Description | Confirmation |
 |------|-------------|--------------|
-| `click_screen(x, y)` | Mouse click (pixel-perfect) via `ydotool` | Voice confirmation ("yes") |
+| `click_screen(x, y, …)` | Frame-grounded mouse click via `ydotool` (current `frame_seq` required; stale frames refused) | Voice confirmation ("yes") |
 | `type_text("text")` | Type text into focused app via `ydotool` | Voice confirmation ("yes") |
 | `press_key(key)` | Press keyboard key (e.g., 'enter') via `ydotool` | Voice confirmation ("yes") |
 | `confirm_action()` | Execute pending risky action after user says "yes" | - |
@@ -103,6 +111,24 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Workspace switching** (user-facing 1–6) + **auto-hide avatar UI**
   after successful desktop-opening/focus actions (visibility-only;
   never sleeps)
+- **Computer-use grounding + stale-frame protection** (`frame_seq`
+  contract, max 2 alternate retries) + **multi-step context**
+  (`ComputerUseContext` across inspect/click/verify turns)
+- **Assistant text stream** (TEXT from output-audio-transcription
+  events; explicit AUDIO+TEXT rejected by the API for this model)
+- **System tray** (live status, Show/Wake/Sleep/Settings, ydotool
+  dialog, Quit) + **readable speech bubble** (wrapping, never
+  clipped, avatar re-layout)
+- **Optional local wake word** (openwakeword "Hey Jarvis", off by
+  default, fully offline)
+- **Settings UI** (key/monitor/voice/approvals; key → OS keyring)
+- **Secure API-key storage** (SecretService keyring; legacy plaintext
+  auto-migrated + scrubbed; precedence secure → legacy → env)
+- **ydotool runtime health/setup** (machine-readable states,
+  `ydotool-status`, user-level setup script, one-time `input`-group
+  step for reboot-proof startup)
+- **Coding-worker reporting** (worker claims vs independently verified
+  facts strictly separated in every report)
 
 ## Project Structure
 ```
@@ -151,8 +177,8 @@ pyautogui>=0.9.54  # pulls ydotool deps
 ```bash
 cd /home/guru/ai-assistant
 PYTHONPATH=src .venv/bin/python -m cat_talker.main
-# or: export GEMINI_API_KEY=your_key_here  # Or set once, saved to config
-sudo systemctl start ydotoold 2>/dev/null || ydotoold &
+# or: export GEMINI_API_KEY=your_key_here  # Or set once via Settings, saved to the OS keyring
+bin/assistant-ydotool-setup  # enables the packaged ydotool.service user unit (user level, never sudo)
 ```
 
 Daily control (any directory, plus Hyprland F1 = UI, F2 = sleep/wake,
@@ -167,7 +193,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 ## Test Results
 ```bash
 ./.venv/bin/python -m pytest -q
-# 409 passed — no hardware, network, speakers, or credentials needed
+# 562 passed — no hardware, network, speakers, or credentials needed
 # (fakes for Live sessions, audio, vision, Qt offscreen, playerctl,
 # subprocess, network). See README "How to run tests" for coverage.
 ```
@@ -179,20 +205,26 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
   perfect guarantee; live-mic validation across wake cycles is
   real-world-pending.
 - **Generic visual clicking** is best-effort (`ydotoold` + `input` group).
-- **No voice wake-word** while sleeping (F2 required); Hyprland needed
+- **No wake word unless enabled** (needs `openwakeword` +
+  `wake_word_enabled: true`; otherwise F2 wakes); Hyprland needed
   for global keys; needs network + valid Gemini API key.
 - **Coding worker has no OS-level sandbox**; worker-reported tests are
   claims until independently verified.
 - **`read_aloud` needs `espeak-ng`**; Weather needs network; web
   search/fetch are bounded best-effort; English/Hindi responses only.
 
-### 🟡 Enhancements (genuinely future)
-1. **Wake Word Detection** - `openwakeword` for hands-free activation
-   (optional dependency; F2 remains the mechanism today)
-2. **System Tray** - Minimize to tray, show status, quick actions
-3. **Settings UI** - In-app configuration panel (hotkeys, monitor, voice, approvals)
-4. **API Key Encryption** - Encrypt stored API key (currently plaintext in config.json)
-5. **Text Response Modality** - Add `response_modalities=["AUDIO", "TEXT"]` for better transcription
+### ✅ Since implemented (were future, now done — kept here for history)
+1. **Wake Word Detection** - optional offline `openwakeword` ("Hey
+   Jarvis", off by default; F2 remains the fallback)
+2. **System Tray** - tray icon with live status, Show/Wake/Sleep,
+   Settings, ydotool dialog, Quit
+3. **Settings UI** - in-app panel (API key → OS keyring, monitor,
+   voice, approvals)
+4. **API Key Encryption** - SecretService keyring storage + legacy
+   plaintext migration/scrub (no plaintext at rest)
+5. **Text Response Modality** - TEXT assembled from
+   output-audio-transcription events (explicit AUDIO+TEXT rejected by
+   the API for this model; audio path untouched)
 
 ### 🟢 Nice to Have
 - **Plugin System** - Dynamic tool loading
@@ -201,7 +233,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ---
 
-*Last verified: 2026-10-05 at checkpoint `ec7276f` (409 tests passing).
+*Last verified: 2026-10-06 at checkpoint `dc95c62` (562 tests passing).
 Live voice-command end-to-end for workspace 5/6 and the auto-hide
 round-trip is real-world-pending (verified at `hyprctl`/tool level +
 offscreen Qt tests).

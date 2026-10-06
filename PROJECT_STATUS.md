@@ -1,13 +1,16 @@
 # AI Assistant — current verified project state
 
-Checkpoint: **`ec7276f`** — *Improve desktop navigation and assistant UX*
-(follows `5ee950c` *Stabilize voice lifecycle and complete core assistant
-stack*). Working tree matches the checkpoint except untracked `.vscode/`
-(IDE state, not project source); everything below is implemented,
-unit-tested (409 passed via `./.venv/bin/python -m pytest -q`), and
-committed. No hardware, network, speakers, or credentials needed for
-the suite (fakes for Live sessions, audio, vision, Qt offscreen,
-playerctl, subprocess, network).
+Checkpoint: **`dc95c62`** — *Make ydotool runtime setup reliable*
+(follows `ae92f80` *Fix tray status and assistant UI*, `b72d466`
+*Secure API key storage with system keyring*, `64ad9d9` *Add assistant
+settings UI*, `9e88759` *Add optional local wake word* — full chain
+back through `ec7276f` and `5ee950c`). Working tree matches the
+checkpoint except untracked `.vscode/` (IDE state, not project
+source); everything below is implemented, unit-tested (562 passed via
+`./.venv/bin/python -m pytest -q`), and committed. No hardware,
+network, speakers, or credentials needed for the suite (fakes for
+Live sessions, audio, vision, Qt offscreen, playerctl, subprocess,
+network).
 
 - Sleep/wake implemented: startup SLEEPING, F2 toggle with busy
   deferral, 60 s meaningful-idle timeout, greeting-once, no reconnect
@@ -36,9 +39,13 @@ playerctl, subprocess, network).
   `audio.py` (16 kHz mic / 24 kHz output), `echo_suppress.py`
   (monitor-reference suppression, bounded staging), `vision.py`
   (grim/mss + Hyprland coordinates), `tools.py` (31 tools incl. voice
-  approval), `sleep.py`, `control.py`, `media_watcher.py`,
+  approval, frame-grounded clicks, multi-step `ComputerUseContext`),
+  `sleep.py`, `control.py`, `media_watcher.py`,
   `web_search.py`, `webpage.py`, `weather.py`, `memory.py`,
-  `speech.py`, `coding_worker.py`.
+  `speech.py`, `coding_worker.py`, `ydotool_health.py` (read-only
+  backend health), `tray.py` (tray icon/menu), `settings.py`
+  (in-app settings panel), `credentials.py` (SecretService keyring
+  storage + legacy migration), `wakeword.py` (offline openwakeword).
 - Voice path: 512-frame (32 ms) mic chunks shared by capture and echo
   DSP; explicit Live VAD (enabled; HIGH start sensitivity, LOW end
   sensitivity, 300 ms prefix padding, 700 ms end silence); input
@@ -81,21 +88,47 @@ playerctl, subprocess, network).
   independently_verified_*): Chibi reports "Worker completed;
   verification was not available." unless independently verified, and
   never says "All tests passed" without verified basis.
+- Computer-use grounding + multi-step context: every inspected frame
+  states its `frame_seq`; `click_screen` takes the current frame's
+  `frame_seq` and refuses stale coordinates (max 2 alternate retries,
+  then asks the user). `ComputerUseContext` carries geometry and
+  frame/action sequences across inspect/click/verify turns.
+- Assistant text stream: TEXT assembled from output-audio-transcription
+  events alongside AUDIO (explicit AUDIO+TEXT modalities are rejected
+  by the API for this model); audio path untouched.
+- System tray: icon + menu with live status row (sleep state + overlay
+  visibility, recomputed on every menu open), Show window, Wake,
+  Sleep, Settings, read-only ydotool status dialog, Quit; tooltip and
+  action enablement from a single state probe.
+- Readable speech bubble: caption text wraps in a full-width top zone
+  (never clipped); avatar shifts down + shrinks while it shows.
+- Optional local wake word ("Hey Jarvis", openwakeword, off by
+  default): fully offline, wakes through the same path as F2; missing
+  dependency/model degrades honestly to F2-only.
+- Settings UI: in-app panel for API key (into the OS keyring),
+  monitor, voice, approvals.
+- Secure API-key storage: SecretService keyring via `keyring`;
+  precedence secure store → legacy plaintext (auto-migrated + file
+  scrubbed) → `GEMINI_API_KEY`.
 - Known limitations:
   - **Echo suppression/audio isolation is improved but defensive, not
     a perfect guarantee** against loud external audio. Live-mic
     validation across wake cycles is still real-world-pending.
    - **Generic visual clicking is best-effort.** Grounding can miss;
      bounded by max-2-alternate retry, then the assistant asks the user.
-     Requires `ydotoold` + `input` group. Backend health is explicit:
-     `bin/assistant-control ydotool-status` reports
-     healthy/missing/stopped/unusable/permission without performing
-     input; `bin/assistant-ydotool-setup` enables the packaged user
-     service (explicit, user-level, never sudo). One-time `sudo usermod
-     -aG input $USER` + re-login makes startup reboot-proof (without
-     it, the boot-time unit races logind's uaccess ACL and fails).
-  - **No voice wake-word while sleeping (F2 required);** Hyprland needed
-    for global keys; needs network + valid Gemini API key.
+      Requires `ydotoold` + `input` group. Backend health is explicit:
+      `bin/assistant-control ydotool-status` reports machine-readable
+      states (healthy, ydotool/daemon missing, stopped, unreachable,
+      unusable, permission) without performing input;
+      `bin/assistant-ydotool-setup` enables the packaged user
+      service (explicit, user-level, never sudo). When the user is
+      definitively outside the `input` group, setup prints the one-time
+      `sudo usermod -aG input $USER` + re-login step that makes startup
+      reboot-proof (without it, the boot-time unit races logind's
+      uaccess ACL and fails).
+   - **No wake word unless enabled:** without `openwakeword` +
+     `wake_word_enabled: true`, F2 is the wake mechanism; Hyprland needed
+     for global keys; needs network + valid Gemini API key.
   - **The coding worker has NO OS-level sandbox.** The boundary is
     validation + cwd/`--dir` scoping + approval + verification; a
     compromised same-UID worker process could theoretically escape it.
