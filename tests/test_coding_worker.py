@@ -698,7 +698,9 @@ def test_approval_still_gates_coding_task(tmp_path, _clean_pending,
 
 from cat_talker.coding_worker import (
     BACKEND_GOOSE,
+    BACKEND_GOOSE_LITE,
     BACKEND_OPENCODE,
+    GOOSE_FLASH_LITE_MODEL,
     GooseWorkerProvider,
     select_backend,
 )
@@ -721,6 +723,31 @@ def test_explicit_backend_selection_chooses_goose(monkeypatch):
     assert isinstance(provider, GooseWorkerProvider)
     monkeypatch.delenv("CAT_TALKER_CODER_BACKEND", raising=False)
     assert isinstance(select_backend(), SubprocessWorkerProvider)
+
+
+def test_explicit_goose_lite_backend_uses_flash_lite(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", BACKEND_GOOSE_LITE)
+    monkeypatch.delenv("CAT_TALKER_GOOSE_MODEL", raising=False)
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    provider = select_backend()
+    assert isinstance(provider, GooseWorkerProvider)
+    result = provider.run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert (seen["argv"][seen["argv"].index("--model") + 1]
+            == GOOSE_FLASH_LITE_MODEL)
+
+
+def test_goose_lite_backend_honors_explicit_model_override(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", BACKEND_GOOSE_LITE)
+    monkeypatch.setenv("CAT_TALKER_GOOSE_MODEL", "gemini-custom-model")
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    provider = select_backend()
+    result = provider.run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert (seen["argv"][seen["argv"].index("--model") + 1]
+            == "gemini-custom-model")
 
 
 def test_invalid_backend_fails_honestly(monkeypatch):
@@ -884,6 +911,12 @@ def test_goose_model_override(tmp_path, monkeypatch):
 def test_goose_default_model_is_validated_flash(tmp_path, monkeypatch):
     monkeypatch.delenv("CAT_TALKER_GOOSE_MODEL", raising=False)
     assert cw.resolve_goose_model() == "gemini-3.8-flash"
+
+
+def test_goose_flash_lite_default_is_explicit():
+    assert cw.GOOSE_FLASH_LITE_MODEL == "gemini-3.5-flash-lite"
+    assert (cw.resolve_goose_model(cw.GOOSE_FLASH_LITE_MODEL)
+            == "gemini-3.5-flash-lite")
 
 
 def test_goose_child_env_isolates_credential(tmp_path, monkeypatch):
