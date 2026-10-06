@@ -164,8 +164,10 @@ network).
     DATA discipline); English/Hindi responses only.
   - **Reminders fire only while the Chibi process runs** (no daemon
     persistence beyond the session); once/daily only, no snooze/edit,
-    no per-reminder sound/channel, notification delivery only. F2/F3
-    live-GUI smoke testing not performed (verified at the
+    no per-reminder sound/channel, notification delivery only. Live
+    F2 wake/listen and F3 quit have since been human-verified PASS on
+    the real desktop; reminder firing itself was validated through
+    the real notification daemon/production path (verified at the
     store/scheduler/tool level plus a headless production-path run).
 - Future work (acceptance phase, not architecture rewrites):
   end-to-end real-world acceptance testing, documentation upkeep,

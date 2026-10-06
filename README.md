@@ -251,7 +251,10 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 - Reminders fire only while the Chibi process runs (no daemon
   persistence beyond the session); once/daily only, no snooze/edit,
   notification delivery only — never scheduled clicks, keys, shell,
-  coding, or web actions. F2/F3 live-GUI smoke testing not performed.
+  coding, or web actions. Live F2 wake/listen and F3 quit have since
+  been human-verified PASS on the real desktop; reminder firing itself
+  was validated through the real notification daemon/production path
+  (headless visual caveat stands).
 - Weather needs network (Open-Meteo); web search/fetch are bounded
   best-effort; English/Hindi responses only.
 
