@@ -18,9 +18,9 @@ independently verified results.
 - **Vision on demand** — `take_screenshot` / `inspect_screen` capture
   (grim on Wayland, mss on X11, multi-monitor aware) and describe or act
   on what is visible.
-- **OS control via tools** — 31 tools: open apps/sites/files, clipboard,
+- **OS control via tools** — 34 tools: open apps/sites/files, clipboard,
   volume, brightness, workspaces, media (`playerctl`), notifications,
-  YouTube search-and-play, and preferences. Risky actions
+  reminders, YouTube search-and-play, and preferences. Risky actions
   (`click_screen`, `type_text`, `press_key`, `run_coding_task`) require
   spoken "yes" approval first. Clicks are visually grounded: every
   inspected frame carries a `frame_seq` number, `click_screen` must be
@@ -63,6 +63,19 @@ independently verified results.
   wake mechanism; detection failure is harmless.
 - **Single overlay window** — exactly one `RadialVisualizerWindow` per
   process, enforced by a singleton factory; hide/show reuses it.
+- **Local reminders** — `create/list/cancel_reminder` for explicit
+  "remind me ..." requests only (never inferred): one-time exact
+  timezone-aware datetimes and daily HH:MM times, persisted as
+  validated JSON (`~/.config/cat-talker/reminders.json`, atomic
+  writes), driven by a single deterministic daemon scheduler thread
+  that fires through the existing desktop-notification path. Once
+  reminders disable after firing; daily ones advance; cancellation
+  persists across restarts. The scheduler is independent of the Live
+  sleep/wake state and stops cleanly on quit. Model contract: only
+  once/daily schedules, local-timezone interpretation, read-only
+  listing, cancel existing ids only, ask rather than guess when the
+  time is ambiguous. Reminders fire only while the process runs; no
+  snooze/edit, no weekly/custom recurrence.
 - **Readable speech bubble** — caption text wraps inside a full-width
   top zone (never clipped); the avatar shifts down and shrinks while
   the bubble shows so the two never overlap.
@@ -92,7 +105,7 @@ User
   │  voice (F2 to wake) · F1 UI · F3 quit
   ▼
 Chibi / Gemini Live assistant (gemini-3.8-live)
-  ├─ desktop + web + media + vision tools (31, approval-gated writes)
+  ├─ desktop + web + media + vision tools (34, approval-gated writes)
   ├─ Weather · Memory · read-aloud (deterministic local modules)
   ▼
 specialized external coding worker (delegated, only when appropriate)
@@ -127,6 +140,7 @@ GeminiDesktopAgent ── Gemini Live session (connect only when awake)
   ├─ speech.py     standalone TTS boundary (local engine, replaceable)
   ├─ media_watcher.py  read-only MPRIS Playing-edge watcher
   ├─ coding_worker.py  delegated execution + verification boundary
+  ├─ reminders.py    validated reminder store + deterministic scheduler
   ├─ ydotool_health.py read-only ydotool backend health + setup hints
   ├─ tray.py         system-tray icon/menu (live status, ydotool dialog)
   ├─ settings.py     in-app settings panel (key, monitor, voice)
@@ -234,6 +248,10 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 - Coding worker has no OS sandbox (see above); worker-reported tests
   are claims until independently verified.
 - `read_aloud` needs `espeak-ng`, else honest failure.
+- Reminders fire only while the Chibi process runs (no daemon
+  persistence beyond the session); once/daily only, no snooze/edit,
+  notification delivery only — never scheduled clicks, keys, shell,
+  coding, or web actions. F2/F3 live-GUI smoke testing not performed.
 - Weather needs network (Open-Meteo); web search/fetch are bounded
   best-effort; English/Hindi responses only.
 
@@ -243,18 +261,18 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-562 passed, no hardware or network needed (fakes for Live sessions,
+580 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
 computer-use grounding + stale-frame protection + multi-step context,
 echo DSP, sleep/wake + F1/F2/F3 control, single-instance launch,
 window lifecycle, shutdown, voice config (VAD/hints/guard), wake
 word, tray + bubble UI, settings, secure credentials + migration,
-media watcher, web info, Weather, Memory, TTS, assistant text
+reminders (store, scheduler, contract), media watcher, web info, Weather, Memory, TTS, assistant text
 stream, coding worker + verification, workspace switching
 (user-facing 1–6), auto-hide visibility behavior, diagnostics, and
 packaging.
 
-Current state: checkpoint `dc95c62`, all green; next phase is product
+Current state: checkpoint `f4514ae`, all green; next phase is product
 acceptance and real-world validation (see `ROADMAP.md`). No `AGENTS.md`
 exists in this repo; engineering rules live with the maintainer.

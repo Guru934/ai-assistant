@@ -8,7 +8,7 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 ### Core Components
 | File | Purpose |
 |------|---------|
-| `src/cat_talker/main.py` | PyQt6 floating UI with animated cat avatar + readable wrapping speech bubble + transcription display + history logger |
+| `src/cat_talker/main.py` | PyQt6 floating UI with animated cat avatar + readable wrapping speech bubble + transcription display + history logger + reminder scheduler lifecycle |
 | `src/cat_talker/tray.py` | System-tray icon/menu: live status row, Show/Wake/Sleep/Settings, read-only ydotool status dialog, Quit |
 | `src/cat_talker/settings.py` | In-app settings panel (API key → OS keyring, monitor, voice, approvals) |
 | `src/cat_talker/credentials.py` | SecretService keyring API-key storage + legacy plaintext migration/scrub |
@@ -17,7 +17,8 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 | `src/cat_talker/agent.py` | Gemini Live orchestration, combining modular audio, vision, and tools. |
 | `src/cat_talker/audio.py` | Audio capture/playback using PyAudio, and volume tracking |
 | `src/cat_talker/vision.py` | Screen capture using `grim` (Wayland native) or `mss` (X11) with multi-monitor support |
-| `src/cat_talker/tools.py` | OS automation functions (`ydotool`, `xdg-open`, PipeWire, `grim`) |
+| `src/cat_talker/tools.py` | OS automation functions (`ydotool`, `xdg-open`, PipeWire, `grim`) + reminders |
+| `src/cat_talker/reminders.py` | Validated reminder store + deterministic scheduler (notification delivery only) |
 | `src/cat_talker/config.py` | Settings persistence (API key, preferences) |
 | `src/cat_talker/logging_config.py` | Structured logging configuration |
 | `pyproject.toml` | Dependencies & project config |
@@ -47,10 +48,11 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Settings Persistence** - API key, preferred monitor, auto-reconnect, voice approval saved to `~/.config/cat-talker/config.json`
 - **Modular Design** - Cleanly separated audio, vision, config, logging, and AI modules
 - **Structured Logging** - All modules use structured logging (DEBUG/INFO/WARNING/ERROR)
-- **Unit Tests** - 562 tests covering lifecycle, audio, sleep/wake,
+- **Unit Tests** - 580 tests covering lifecycle, audio, sleep/wake,
   control/launch, vision, tools, grounding + stale-frame protection +
   multi-step context, web info, Weather, Memory, TTS, assistant text
-  stream, coding worker + verification, workspace switching (1–6),
+  stream, coding worker + verification, reminders (store, scheduler,
+  firing, contract), workspace switching (1–6),
   auto-hide visibility, tray + bubble UI, wake word, settings, secure
   credentials + migration, ydotool health/setup, diagnostics (see
   "Test Results" below)
@@ -84,6 +86,9 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 | `delete_preference(key)` | Explicitly delete a preference |
 | `read_aloud(text)` | Speak text via local `espeak-ng` through existing playback |
 | `run_coding_task(task, workspace)` | Delegate coding work (voice approval; verified reporting) |
+| `create_reminder(message, kind, …)` | Explicit reminder request: once (exact aware datetime) or daily (HH:MM); notification only |
+| `list_reminders()` | Read-only reminder listing, soonest first |
+| `cancel_reminder(id)` | Cancel by existing id (persists across restarts) |
 
 ### ⚠️ Risky Tools (Voice Confirmation Required)
 | Tool | Description | Confirmation |
@@ -129,6 +134,10 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
   step for reboot-proof startup)
 - **Coding-worker reporting** (worker claims vs independently verified
   facts strictly separated in every report)
+- **Local reminders** (explicit requests only; once/daily; validated
+  JSON store + deterministic scheduler + notification delivery;
+  model contract: never invent, read-only list, cancel existing
+  only, ask rather than guess)
 
 ## Project Structure
 ```
@@ -139,7 +148,7 @@ cat-talker/
 │   ├── agent.py             # Gemini Live orchestration + exponential backoff reconnect
 │   ├── audio.py             # Audio streams + fixed volume calc + idempotent close()
 │   ├── vision.py            # Multi-monitor Grim/MSS capture with monitor targeting
-│   ├── tools.py             # 31 tools with monitor param support
+│   ├── tools.py             # 34 tools with monitor param support
 │   ├── sleep.py             # Sleep/wake state machine + idle policy
 │   ├── control.py           # Control socket server (runtime-dir locking)
 │   ├── media_watcher.py     # Read-only MPRIS Playing-edge watcher
@@ -193,7 +202,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 ## Test Results
 ```bash
 ./.venv/bin/python -m pytest -q
-# 562 passed — no hardware, network, speakers, or credentials needed
+# 580 passed — no hardware, network, speakers, or credentials needed
 # (fakes for Live sessions, audio, vision, Qt offscreen, playerctl,
 # subprocess, network). See README "How to run tests" for coverage.
 ```
@@ -212,6 +221,10 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
   claims until independently verified.
 - **`read_aloud` needs `espeak-ng`**; Weather needs network; web
   search/fetch are bounded best-effort; English/Hindi responses only.
+- **Reminders fire only while the Chibi process runs**; once/daily
+  only, no snooze/edit, notification delivery only (never scheduled
+  clicks/keys/shell/coding/web); F2/F3 live-GUI smoke testing not
+  performed.
 
 ### ✅ Since implemented (were future, now done — kept here for history)
 1. **Wake Word Detection** - optional offline `openwakeword` ("Hey
@@ -233,7 +246,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ---
 
-*Last verified: 2026-10-06 at checkpoint `dc95c62` (562 tests passing).
+*Last verified: 2026-10-06 at checkpoint `f4514ae` (580 tests passing).
 Live voice-command end-to-end for workspace 5/6 and the auto-hide
 round-trip is real-world-pending (verified at `hyprctl`/tool level +
 offscreen Qt tests).

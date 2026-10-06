@@ -1,4 +1,4 @@
-Completed (all implemented and committed as of `dc95c62`, follows `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
+Completed (all implemented and committed as of `f4514ae`, follows `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
 ├── Core voice assistant
 ├── Gemini Live lifecycle
 ├── OS controls
@@ -34,8 +34,14 @@ Completed (all implemented and committed as of `dc95c62`, follows `ae92f80`, `b7
 ├── Optional local wake word (openwakeword "Hey Jarvis", off by default)
 ├── Settings UI (key/monitor/voice/approvals)
 ├── Secure API-key storage (SecretService keyring + legacy migration)
-└── ydotool runtime health/setup (machine-readable states,
-    user-level setup, one-time `input`-group step)
+├── ydotool runtime health/setup (machine-readable states,
+│   user-level setup, one-time `input`-group step)
+├── Deterministic bubble geometry test (window-relative assertion)
+└── Local reminders, first slice (create/list/cancel; once-exact +
+    daily-recurring; validated JSON store; deterministic scheduler;
+    notification delivery only; sleep/wake-independent; clean
+    shutdown; persistent cancellation; explicit-request model
+    contract)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── End-to-end acceptance testing (live mic across wake cycles)

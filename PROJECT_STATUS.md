@@ -1,12 +1,14 @@
 # AI Assistant — current verified project state
 
-Checkpoint: **`dc95c62`** — *Make ydotool runtime setup reliable*
-(follows `ae92f80` *Fix tray status and assistant UI*, `b72d466`
-*Secure API key storage with system keyring*, `64ad9d9` *Add assistant
-settings UI*, `9e88759` *Add optional local wake word* — full chain
-back through `ec7276f` and `5ee950c`). Working tree matches the
+Checkpoint: **`f4514ae`** — *feat: clarify reminder tool contract*
+(follows `ddcf750` *feat: add deterministic local reminders*,
+`47039dd` *test: make bubble geometry assertion window-relative*,
+`dfac8f0` *docs: sync project status after ydotool and UX work*,
+`dc95c62` *Make ydotool runtime setup reliable*, `ae92f80` *Fix tray
+status and assistant UI* — full chain back through `b72d466`,
+`ec7276f` and `5ee950c`). Working tree matches the
 checkpoint except untracked `.vscode/` (IDE state, not project
-source); everything below is implemented, unit-tested (562 passed via
+source); everything below is implemented, unit-tested (580 passed via
 `./.venv/bin/python -m pytest -q`), and committed. No hardware,
 network, speakers, or credentials needed for the suite (fakes for
 Live sessions, audio, vision, Qt offscreen, playerctl, subprocess,
@@ -38,14 +40,16 @@ network).
   `GeminiDesktopAgent` (Gemini Live, model `gemini-3.8-live`) with
   `audio.py` (16 kHz mic / 24 kHz output), `echo_suppress.py`
   (monitor-reference suppression, bounded staging), `vision.py`
-  (grim/mss + Hyprland coordinates), `tools.py` (31 tools incl. voice
-  approval, frame-grounded clicks, multi-step `ComputerUseContext`),
+  (grim/mss + Hyprland coordinates), `tools.py` (34 tools incl. voice
+  approval, frame-grounded clicks, multi-step `ComputerUseContext`,
+  reminders),
   `sleep.py`, `control.py`, `media_watcher.py`,
   `web_search.py`, `webpage.py`, `weather.py`, `memory.py`,
   `speech.py`, `coding_worker.py`, `ydotool_health.py` (read-only
   backend health), `tray.py` (tray icon/menu), `settings.py`
   (in-app settings panel), `credentials.py` (SecretService keyring
-  storage + legacy migration), `wakeword.py` (offline openwakeword).
+  storage + legacy migration), `wakeword.py` (offline openwakeword),
+  `reminders.py` (validated reminder store + deterministic scheduler).
 - Voice path: 512-frame (32 ms) mic chunks shared by capture and echo
   DSP; explicit Live VAD (enabled; HIGH start sensitivity, LOW end
   sensitivity, 300 ms prefix padding, 700 ms end silence); input
@@ -110,6 +114,20 @@ network).
 - Secure API-key storage: SecretService keyring via `keyring`;
   precedence secure store → legacy plaintext (auto-migrated + file
   scrubbed) → `GEMINI_API_KEY`.
+- Local reminders (explicit requests only, never inferred):
+  `create/list/cancel_reminder` for one-time exact timezone-aware
+  datetimes and daily HH:MM times; validated JSON store
+  (`~/.config/cat-talker/reminders.json`, atomic tmp+replace writes,
+  malformed data tolerated); single deterministic daemon scheduler
+  thread per process (idempotent start, clean stop via the existing
+  `request_agent_stop` path covering F3/signals/Qt-quit); fires via
+  the existing `send_notification` path only — never clicks, keys,
+  shell, coding, or web actions. Once reminders disable after firing,
+  daily ones advance, cancellation persists across restarts. The
+  scheduler is independent of Live sleep/wake state. Model contract
+  (system instructions + tool docstrings): explicit requests only,
+  once/daily only, never invent, list is read-only, cancel existing
+  ids only, local-timezone interpretation, ask rather than guess.
 - Known limitations:
   - **Echo suppression/audio isolation is improved but defensive, not
     a perfect guarantee** against loud external audio. Live-mic
@@ -141,6 +159,11 @@ network).
   - Weather needs network (Open-Meteo, no key); web search/fetch are
     bounded best-effort (single DuckDuckGo Lite provider; UNTRUSTED
     DATA discipline); English/Hindi responses only.
+  - **Reminders fire only while the Chibi process runs** (no daemon
+    persistence beyond the session); once/daily only, no snooze/edit,
+    no per-reminder sound/channel, notification delivery only. F2/F3
+    live-GUI smoke testing not performed (verified at the
+    store/scheduler/tool level plus a headless production-path run).
 - Future work (acceptance phase, not architecture rewrites):
   end-to-end real-world acceptance testing, documentation upkeep,
   UX polish from real usage, remaining audio/echo edge cases, stronger
