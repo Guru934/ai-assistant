@@ -983,6 +983,89 @@ def save_user_preference(key: str, value: str) -> str:
     except Exception as e:
         return f"Failed to save preference: {e}"
 
+# ─── REMINDERS (deterministic local scheduler) ────────────────────
+
+def create_reminder(message: str = "", kind: str = "once", at: str = "",
+                    time: str = "", timezone_str: str = "") -> str:
+    """Create a local reminder that fires a desktop notification.
+
+    Call ONLY for a reminder the user explicitly requested ('remind me
+    ...'). Never invent schedules. Two schedule types:
+    - kind='once': needs 'at' (timezone-aware ISO datetime, e.g.
+      2026-10-07T09:00:00+05:30); fires once, then disables itself.
+    - kind='daily': needs 'time' (HH:MM 24-hour local time, e.g.
+      09:00); fires every day at that time.
+    'timezone_str' is an IANA name (e.g. 'Asia/Kolkata'); empty means
+    the system local zone. Never raises: invalid input returns an
+    honest 'Error: ...' message.
+
+    Args:
+        message: Reminder text (required, non-empty).
+        kind: 'once' or 'daily'.
+        at: Exact fire time for kind='once' (aware ISO datetime).
+        time: Daily fire time for kind='daily' (HH:MM 24-hour).
+        timezone_str: IANA timezone name, or empty for system local.
+    """
+    try:
+        from cat_talker import reminders as reminders_mod
+        record = reminders_mod.get_scheduler().store.create(
+            message, kind, at, time, timezone_str)
+        reminders_mod.get_scheduler().wake()
+        from datetime import datetime as _dt
+        due = _dt.fromisoformat(record["next_due"])
+        when = due.strftime("%Y-%m-%d %H:%M %Z")
+        again = " (repeats daily)" if record["kind"] == "daily" else ""
+        return (f"Reminder created (id {record['id']}): "
+                f"'{record['message']}' fires at {when}{again}.")
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def list_reminders(include_disabled: bool = False) -> str:
+    """List scheduled reminders (soonest first). Read-only.
+
+    Args:
+        include_disabled: When true, also show cancelled/completed
+            reminders; otherwise only active ones.
+    """
+    try:
+        from cat_talker import reminders as reminders_mod
+        records = reminders_mod.get_scheduler().store.list(
+            include_disabled=include_disabled)
+        if not records:
+            return "No reminders scheduled."
+        from datetime import datetime as _dt
+        lines = []
+        for record in records:
+            due = _dt.fromisoformat(record["next_due"])
+            when = due.strftime("%Y-%m-%d %H:%M %Z")
+            state = "active" if record["enabled"] else "disabled"
+            repeat = ", repeats daily" if record["kind"] == "daily" else ""
+            lines.append(f"- id {record['id']}: '{record['message']}' "
+                         f"at {when} ({state}{repeat})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def cancel_reminder(reminder_id: str = "") -> str:
+    """Cancel a scheduled reminder by id (see list_reminders).
+
+    Cancellation persists: a cancelled reminder never fires, even
+    after restart. Never raises: unknown ids return an honest message.
+
+    Args:
+        reminder_id: The reminder id to cancel.
+    """
+    try:
+        from cat_talker import reminders as reminders_mod
+        if reminders_mod.get_scheduler().store.cancel(reminder_id):
+            return f"Reminder {reminder_id.strip()} cancelled."
+        return f"Error: unknown reminder id '{reminder_id.strip()}'."
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # ─── COMPLETE TOOL REGISTRY ─────────────────────────────────────
 
 ALL_TOOLS = [
@@ -993,7 +1076,8 @@ ALL_TOOLS = [
     inspect_screen, save_user_preference, get_current_datetime,
     web_search, fetch_webpage, get_weather,
     get_preference, set_preference, delete_preference,
-    read_aloud, run_coding_task
+    read_aloud, run_coding_task,
+    create_reminder, list_reminders, cancel_reminder
 ]
 
 

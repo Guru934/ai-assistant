@@ -35,6 +35,7 @@ SIDE_EFFECT_TOOLS = frozenset({
     "click_screen", "type_text", "press_key",
     "save_user_preference", "set_preference", "delete_preference",
     "read_aloud", "run_coding_task",
+    "create_reminder", "cancel_reminder",
 })
 
 # Maximum fetch_webpage calls per user interaction (resets each turn).

@@ -970,6 +970,12 @@ def main():
     )
     agent_thread.start()
 
+    # Local reminders: exactly one deterministic scheduler per process
+    # (guarded start; tools fall back to get_scheduler anyway). It only
+    # raises desktop notifications - never clicks, keys, or actions.
+    from cat_talker import reminders as reminders_mod
+    reminders_mod.start_reminder_scheduler()
+
     # Graceful shutdown: Ctrl-C / SIGTERM (and any Qt quit path) must stop
     # the agent, unwind asyncio, close audio, join the agent thread, then
     # quit Qt. Without this, SIGINT lands as KeyboardInterrupt inside
@@ -982,6 +988,10 @@ def main():
                 candidate.request_stop()
             except Exception:
                 pass
+        try:
+            reminders_mod.stop_reminder_scheduler()
+        except Exception:
+            pass
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
