@@ -37,16 +37,18 @@ Completed (all implemented and committed as of `f4514ae`, follows `ddcf750`, `47
 ├── ydotool runtime health/setup (machine-readable states,
 │   user-level setup, one-time `input`-group step)
 ├── Deterministic bubble geometry test (window-relative assertion)
-└── Local reminders, first slice (create/list/cancel; once-exact +
-    daily-recurring; validated JSON store; deterministic scheduler;
-    notification delivery only; sleep/wake-independent; clean
-    shutdown; persistent cancellation; explicit-request model
-    contract)
+├── Local reminders, first slice (create/list/cancel; once-exact +
+│   daily-recurring; validated JSON store; deterministic scheduler;
+│   notification delivery only; sleep/wake-independent; clean
+│   shutdown; persistent cancellation; explicit-request model
+│   contract)
+└── Spoken live-desktop acceptance, human-verified PASS (workspace 5/6
+    switching, app-open auto-hide, F1 hide/show round-trip with
+    usable session after restore, F2 wake/listen, F3 quit;
+    workspace changes do not auto-hide; no defects)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── End-to-end acceptance testing (live mic across wake cycles)
-├── Spoken acceptance: workspace 5/6 switching + auto-hide round-trip
-└── (hide → F1 restore; workspace change must not hide)
 ├── Documentation maintenance
 ├── UX/polish based on real usage
 ├── Remaining audio/echo edge cases

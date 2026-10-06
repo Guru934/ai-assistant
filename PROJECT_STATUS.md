@@ -154,8 +154,10 @@ network).
      it, it fails honestly with install guidance.
    - Live voice-command end-to-end for workspace 5/6 switching and the
      auto-hide round-trip (hide → F1/`"Show yourself"` restore) is
-     real-world-pending: verified at the `hyprctl`/tool level plus
-     offscreen Qt tests, awaiting a spoken acceptance pass.
+     human-verified PASS on the live desktop (workspace 5/6 switching,
+     app-open auto-hide, F1 restore, F2 wake/listen, F3 quit; no
+     defects), in addition to the `hyprctl`/tool-level plus offscreen
+     Qt coverage.
   - Weather needs network (Open-Meteo, no key); web search/fetch are
     bounded best-effort (single DuckDuckGo Lite provider; UNTRUSTED
     DATA discipline); English/Hindi responses only.
@@ -166,5 +168,5 @@ network).
     store/scheduler/tool level plus a headless production-path run).
 - Future work (acceptance phase, not architecture rewrites):
   end-to-end real-world acceptance testing, documentation upkeep,
-  UX polish from real usage, remaining audio/echo edge cases, stronger
-  visual grounding, worker sandboxing improvements if needed.
+  UX polish from real usage, remaining audio/echo edge cases,
+  worker sandboxing improvements if needed.
