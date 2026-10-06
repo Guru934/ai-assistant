@@ -734,7 +734,8 @@ def test_explicit_goose_lite_backend_uses_flash_lite(
     assert isinstance(provider, GooseWorkerProvider)
     result = provider.run(build_request(str(tmp_path), "fix bug"))
     assert result.ok is True
-    assert seen["argv"][seen["argv"].index("--model") + 1] ==         GOOSE_FLASH_LITE_MODEL
+    assert (seen["argv"][seen["argv"].index("--model") + 1]
+            == GOOSE_FLASH_LITE_MODEL)
 
 
 def test_goose_lite_backend_honors_explicit_model_override(
@@ -745,7 +746,8 @@ def test_goose_lite_backend_honors_explicit_model_override(
     provider = select_backend()
     result = provider.run(build_request(str(tmp_path), "fix bug"))
     assert result.ok is True
-    assert seen["argv"][seen["argv"].index("--model") + 1] ==         "gemini-custom-model"
+    assert (seen["argv"][seen["argv"].index("--model") + 1]
+            == "gemini-custom-model")
 
 
 def test_invalid_backend_fails_honestly(monkeypatch):
@@ -913,7 +915,8 @@ def test_goose_default_model_is_validated_flash(tmp_path, monkeypatch):
 
 def test_goose_flash_lite_default_is_explicit():
     assert cw.GOOSE_FLASH_LITE_MODEL == "gemini-3.5-flash-lite"
-    assert cw.resolve_goose_model(cw.GOOSE_FLASH_LITE_MODEL) ==         "gemini-3.5-flash-lite"
+    assert (cw.resolve_goose_model(cw.GOOSE_FLASH_LITE_MODEL)
+            == "gemini-3.5-flash-lite")
 
 
 def test_goose_child_env_isolates_credential(tmp_path, monkeypatch):

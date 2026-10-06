@@ -55,10 +55,12 @@ independently verified results.
   separate: results are reported as verified only after independent
   local checks; otherwise "verification was not available."
   OpenCode is the default backend; Goose is an explicit opt-in
-  second backend behind the same provider abstraction
-  (`CAT_TALKER_CODER_BACKEND=goose`), running headless with Chibi's
-  secure Gemini key handed to the Goose child only as
-  `GOOGLE_API_KEY`. Neither backend is sandboxed.
+  backend behind the same provider abstraction. `goose` uses
+  `gemini-3.8-flash` by default; `goose-lite` uses
+  `gemini-3.5-flash-lite`. Both use Chibi's secure Gemini key handed
+  to the Goose child only as `GOOGLE_API_KEY`. Either Goose variant
+  can be given an explicit model through `CAT_TALKER_GOOSE_MODEL`.
+  Neither backend is sandboxed.
 - **Sleep/wake with 60 s meaningful-idle timeout** — starts SLEEPING (no
   Live session, no mic forwarding). Waking opens one fresh session;
   sleeping closes it cleanly with no reconnect loop. Only accepted
@@ -198,6 +200,22 @@ Normal daily control is via the launcher (works from any directory):
 /home/guru/ai-assistant/bin/assistant-control toggle   # wake or sleep
 /home/guru/ai-assistant/bin/assistant-control status
 ```
+
+Coding worker backend selection is explicit. OpenCode remains the default.
+For Goose with Gemini 3.8 Flash:
+
+```bash
+set -x CAT_TALKER_CODER_BACKEND goose
+```
+
+For Goose with Gemini 3.5 Flash-Lite:
+
+```bash
+set -x CAT_TALKER_CODER_BACKEND goose-lite
+```
+
+For either Goose backend, `CAT_TALKER_GOOSE_MODEL` overrides the
+backend's default model.
 
 The app starts SLEEPING (visible, silent, no Gemini connection) and waits
 for F2. `assistant-control stop` quits it gracefully. If a second copy is
