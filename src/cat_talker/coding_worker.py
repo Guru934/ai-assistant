@@ -52,6 +52,17 @@ VERIFY_TRUNCATION_NOTE = "\n...[verification output truncated]"
 DEFAULT_CLI_BIN = "opencode"
 DEFAULT_CLI_ARGS = ("run",)
 
+# Explicit backend selection: CAT_TALKER_CODER_BACKEND=opencode|goose.
+# OpenCode is always the default; Goose runs only when explicitly
+# requested. Anything else fails honestly (never a silent fallback).
+BACKEND_OPENCODE = "opencode"
+BACKEND_GOOSE = "goose"
+BACKENDS = (BACKEND_OPENCODE, BACKEND_GOOSE)
+GOOSE_CLI_BIN = "goose"
+# Bounded agent iterations per task (verified `goose run --help` flag;
+# the subprocess timeout below remains the hard wall).
+GOOSE_MAX_TURNS = 25
+
 
 def _protected_roots() -> list:
     """Runtime paths the worker may never touch, in any workspace."""
@@ -455,6 +466,18 @@ class SubprocessWorkerProvider(WorkerProvider):
         except (TypeError, ValueError):
             self.timeout = WORKER_TIMEOUT_DEFAULT
 
+    def _build_argv(self, resolved: str, req: WorkerRequest) -> list:
+        """Argv for the worker process. Subclasses override ONLY this:
+        validation, spawning, timeout, cleanup, output bounds, and
+        result parsing stay shared below."""
+        prompt = req.task
+        if req.constraints:
+            prompt += "\nConstraints: " + req.constraints
+        # Explicit project scoping alongside cwd (--dir is advisory to
+        # the agent, not a sandbox; see module docstring).
+        return ([resolved] + list(self.extra_args)
+                + ["--dir", req.workspace, prompt])
+
     def run(self, request: WorkerRequest) -> WorkerResult:
         req = request.validated()
         resolved = shutil.which(self.binary)
@@ -464,13 +487,7 @@ class SubprocessWorkerProvider(WorkerProvider):
                 error=f"Coding worker not installed: '{self.binary}' "
                       f"not found on PATH.",
                 workspace=req.workspace)
-        prompt = req.task
-        if req.constraints:
-            prompt += "\nConstraints: " + req.constraints
-        # Explicit project scoping alongside cwd (--dir is advisory to
-        # the agent, not a sandbox; see module docstring).
-        argv = ([resolved] + list(self.extra_args)
-                + ["--dir", req.workspace, prompt])
+        argv = self._build_argv(resolved, req)
         timeout = min(req.timeout, self.timeout)
         try:
             proc = subprocess.Popen(
@@ -505,6 +522,42 @@ class SubprocessWorkerProvider(WorkerProvider):
                                    out_cut or err_cut, req.workspace)
 
 
+class GooseWorkerProvider(SubprocessWorkerProvider):
+    """Run Goose (explicit opt-in backend) as a bounded argv-only process.
+
+    Uses the locally verified headless shape (`goose run --no-session
+    -q --max-turns N -t prompt`, cwd=workspace). Plain-text stdout is
+    consumed by the shared result path; `--output-format json` is a
+    future follow-up once a real coding-task JSON result is captured.
+    Goose is never configured from here: a missing binary or missing
+    provider setup fails honestly. Same honesty as the default CLI:
+    argv-only, cwd-scoped, timeout-bound, no OS sandbox — Goose runs
+    with the user's privileges inside the validated workspace.
+    """
+
+    name = "goose-cli"
+
+    def __init__(self, binary: str | None = None,
+                 max_turns: int = GOOSE_MAX_TURNS,
+                 timeout: int = WORKER_TIMEOUT_DEFAULT):
+        super().__init__(binary=(binary if isinstance(binary, str)
+                                 and binary.strip() else GOOSE_CLI_BIN),
+                         extra_args=(), timeout=timeout)
+        try:
+            self.max_turns = max(1, min(100, int(max_turns)))
+        except (TypeError, ValueError):
+            self.max_turns = GOOSE_MAX_TURNS
+
+    def _build_argv(self, resolved: str, req: WorkerRequest) -> list:
+        prompt = req.task
+        if req.constraints:
+            prompt += "\nConstraints: " + req.constraints
+        # No --dir equivalent exists (verified `goose run --help`):
+        # cwd=workspace (set by the shared run path) is the scope.
+        return [resolved, "run", "--no-session", "-q",
+                "--max-turns", str(self.max_turns), "-t", prompt]
+
+
 def _kill_process_group(proc):
     """Best-effort process-group cleanup (used on timeout paths)."""
     try:
@@ -520,6 +573,23 @@ def _kill_process_group(proc):
 _DEFAULT_PROVIDER = SubprocessWorkerProvider()
 
 
+def select_backend(name: str | None = None) -> WorkerProvider:
+    """Choose the coding backend explicitly. OpenCode is always the
+    default; Goose runs only on explicit request. Raises ValueError
+    on unknown names (never a silent fallback)."""
+    cleaned = (name if isinstance(name, str) and name.strip()
+               else os.environ.get("CAT_TALKER_CODER_BACKEND", "")).strip().lower()
+    if not cleaned:
+        cleaned = BACKEND_OPENCODE
+    if cleaned == BACKEND_GOOSE:
+        return GooseWorkerProvider()
+    if cleaned == BACKEND_OPENCODE:
+        return SubprocessWorkerProvider()
+    raise ValueError(
+        f"Coding error: unknown coder backend '{cleaned}'. "
+        f"Allowed: {', '.join(BACKENDS)}.")
+
+
 def get_default_provider() -> WorkerProvider:
     return _DEFAULT_PROVIDER
 
@@ -530,7 +600,8 @@ def delegate(request: WorkerRequest | dict,
     try:
         req = request.validated() if isinstance(
             request, WorkerRequest) else build_request(**request)
-        engine = provider if provider is not None else _DEFAULT_PROVIDER
+        engine = (provider if provider is not None
+                  else select_backend())
         try:
             result = engine.run(req)
         except NotImplementedError as e:

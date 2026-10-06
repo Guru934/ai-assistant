@@ -684,3 +684,177 @@ def test_approval_still_gates_coding_task(tmp_path, _clean_pending,
     paused = run_coding_task("add a file", ws)
     assert "PAUSED FOR SAFETY" in paused
     assert "Do you confirm" in paused
+
+
+# ─── Goose backend (explicit opt-in; OpenCode stays default) ─────────
+
+from cat_talker.coding_worker import (
+    BACKEND_GOOSE,
+    BACKEND_OPENCODE,
+    GooseWorkerProvider,
+    select_backend,
+)
+
+
+def test_opencode_is_default_backend(tmp_path, monkeypatch):
+    monkeypatch.delenv("CAT_TALKER_CODER_BACKEND", raising=False)
+    provider = select_backend()
+    assert isinstance(provider, SubprocessWorkerProvider)
+    assert not isinstance(provider, GooseWorkerProvider)
+    seen = _mock_popen(monkeypatch)
+    result = provider.run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert seen["argv"][0] == "/usr/bin/opencode"
+
+
+def test_explicit_backend_selection_chooses_goose(monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", "goose")
+    provider = select_backend()
+    assert isinstance(provider, GooseWorkerProvider)
+    monkeypatch.delenv("CAT_TALKER_CODER_BACKEND", raising=False)
+    assert isinstance(select_backend(), SubprocessWorkerProvider)
+
+
+def test_invalid_backend_fails_honestly(monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", "clippy")
+    with pytest.raises(ValueError, match="unknown coder backend"):
+        select_backend()
+
+
+def test_goose_argv_exact_shape(tmp_path, monkeypatch):
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    provider = GooseWorkerProvider()
+    result = provider.run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert seen["argv"] == ["/home/guru/.local/bin/goose", "run",
+                            "--no-session", "-q", "--max-turns", "25",
+                            "-t", "fix bug"]
+    assert "shell" not in seen["kwargs"]
+    assert seen["kwargs"]["start_new_session"] is True
+
+
+def test_goose_argv_carries_constraints(tmp_path, monkeypatch):
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    GooseWorkerProvider().run(build_request(
+        str(tmp_path), "fix bug", constraints="no new deps"))
+    assert seen["argv"][-1] == "fix bug\nConstraints: no new deps"
+
+
+def test_goose_cwd_is_validated_workspace(tmp_path, monkeypatch):
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    GooseWorkerProvider().run(build_request(str(tmp_path), "fix bug"))
+    assert seen["kwargs"]["cwd"] == os.path.realpath(str(tmp_path))
+
+
+def test_goose_rejects_protected_workspace_before_start(
+        tmp_path, monkeypatch):
+    started = []
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda _: "/home/guru/.local/bin/goose")
+    real_popen = cw.subprocess.Popen
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: started.append((a, k)))
+    protected = os.path.realpath(os.path.expanduser("~/.config/cat-talker"))
+    os.makedirs(protected, exist_ok=True)
+    with pytest.raises(PermissionError):
+        GooseWorkerProvider().run(build_request(protected, "fix bug"))
+    assert started == [], "worker process started despite denial"
+    assert real_popen is not None
+
+
+def test_goose_timeout_kills_process_group(tmp_path, monkeypatch):
+    _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose")
+    killed = []
+
+    class _Hanging(_FakePopen):
+        def communicate(self, timeout=5):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _Hanging())
+    monkeypatch.setattr(cw.os, "killpg",
+                        lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(cw.os, "getpgid", lambda pid: 777)
+    result = GooseWorkerProvider(timeout=5).run(
+        build_request(str(tmp_path), "slow", timeout=5))
+    assert result.ok is False
+    assert "timed out" in result.error
+    assert killed, "goose process group was not cleaned up"
+
+
+def test_goose_stdout_bounded(tmp_path, monkeypatch):
+    big = "x" * (cw.OUTPUT_MAX_BYTES + 1000)
+    seen = _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose",
+                       popen=_FakePopen(out=big))
+    result = GooseWorkerProvider().run(
+        build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert result.truncated is True
+    assert len(result.summary.encode("utf-8")) <= cw.OUTPUT_MAX_BYTES + 64
+    assert seen["proc"].timeout_used == 300
+
+
+def test_goose_nonzero_exit_is_honest_failure(tmp_path, monkeypatch):
+    _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose",
+                popen=_FakePopen(out="", err="boom", code=2))
+    result = GooseWorkerProvider().run(
+        build_request(str(tmp_path), "fix bug"))
+    assert result.ok is False
+    assert "boom" in result.error
+
+
+def test_goose_missing_binary_is_honest(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw.shutil, "which", lambda _: None)
+    result = GooseWorkerProvider().run(
+        build_request(str(tmp_path), "fix bug"))
+    assert result.ok is False
+    assert "not installed" in result.error
+    assert "goose" in result.error
+
+
+def test_goose_result_verifies_independently(tmp_path, monkeypatch):
+    target = os.path.join(str(tmp_path), "fixed.py")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=["true"])
+    _mock_popen(monkeypatch, binary="/home/guru/.local/bin/goose",
+                popen=_FakePopen(
+                    out='{"summary": "fixed", "files_changed": ["fixed.py"],'
+                        ' "tests_passed": true}'))
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        _recording_popen(monkeypatch))
+    result = GooseWorkerProvider().run(req)
+    assert result.ok is True
+    verified = cw.verify_result(req, result)
+    assert verified.verification == "independently_verified_pass"
+    assert "independently verified" in verified.render()
+
+
+def _recording_popen(monkeypatch):
+    import subprocess as _sp
+
+    def _fake(argv, **kwargs):
+        if argv and argv[0] == "true":
+            return _FakePopen(out="ok", code=0)
+        return _FakePopen(out="goose did work", code=0)
+    return _fake
+
+
+def test_goose_approval_behavior_unchanged(tmp_path, _clean_pending,
+                                          monkeypatch):
+    from cat_talker.tools import run_coding_task
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", "goose")
+    out = run_coding_task("add logging", str(tmp_path))
+    assert "PAUSED FOR SAFETY" in out
+    assert _clean_pending.PENDING_RISKY_ACTION is not None
+
+
+def test_opencode_argv_unchanged_regression(tmp_path, monkeypatch):
+    seen = _mock_popen(monkeypatch)
+    result = SubprocessWorkerProvider().run(
+        build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert seen["argv"] == ["/usr/bin/opencode", "run",
+                            "--dir", os.path.realpath(str(tmp_path)),
+                            "fix bug"]
