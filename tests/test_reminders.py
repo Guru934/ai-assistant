@@ -281,6 +281,39 @@ def test_tool_surface_end_to_end(tmp_path, clock, monkeypatch):
         sched.stop(timeout=5.0)
 
 
+# Model-facing contract: guidance + tool exposure (no network) ---------
+def test_system_guidance_reminder_contract():
+    from cat_talker.agent import build_system_instructions
+    text = build_system_instructions()
+    for tool in ("create_reminder", "list_reminders", "cancel_reminder"):
+        assert tool in text, tool
+    lowered = text.lower()
+    assert "merely mentioning a future" in lowered
+    assert "read-only" in lowered
+    assert "ask instead of guessing" in lowered
+    assert "daily" in lowered and "once" in lowered
+    assert "never cancel an arbitrary one" in lowered
+
+
+def test_reminder_tools_exposed_exactly_once():
+    from cat_talker.tools import ALL_TOOLS
+    names = [f.__name__ for f in ALL_TOOLS]
+    for tool in ("create_reminder", "list_reminders", "cancel_reminder"):
+        assert names.count(tool) == 1, tool
+
+
+def test_reminder_tool_docstrings_carry_key_constraints():
+    from cat_talker import tools as tools_mod
+    create_doc = tools_mod.create_reminder.__doc__ or ""
+    list_doc = tools_mod.list_reminders.__doc__ or ""
+    cancel_doc = tools_mod.cancel_reminder.__doc__ or ""
+    assert "explicitly requested" in create_doc
+    assert "ask the user first" in create_doc
+    assert "daily" in create_doc
+    assert "read-only" in list_doc.lower()
+    assert "existing id" in cancel_doc
+
+
 def test_malformed_store_is_tolerated(tmp_path):
     path = str(tmp_path / "reminders.json")
     with open(path, "w", encoding="utf-8") as f:

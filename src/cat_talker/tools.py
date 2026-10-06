@@ -997,7 +997,9 @@ def create_reminder(message: str = "", kind: str = "once", at: str = "",
       09:00); fires every day at that time.
     'timezone_str' is an IANA name (e.g. 'Asia/Kolkata'); empty means
     the system local zone. Never raises: invalid input returns an
-    honest 'Error: ...' message.
+    honest 'Error: ...' message. Merely mentioning a future task is
+    not a request - if the time, date, or recurrence is missing or
+    ambiguous, ask the user first instead of calling.
 
     Args:
         message: Reminder text (required, non-empty).
@@ -1049,7 +1051,7 @@ def list_reminders(include_disabled: bool = False) -> str:
 
 
 def cancel_reminder(reminder_id: str = "") -> str:
-    """Cancel a scheduled reminder by id (see list_reminders).
+    """Cancel a scheduled reminder by its existing id (see list_reminders).
 
     Cancellation persists: a cancelled reminder never fires, even
     after restart. Never raises: unknown ids return an honest message.
