@@ -205,13 +205,13 @@ Coding worker backend selection is explicit. OpenCode remains the default.
 For Goose with Gemini 3.8 Flash:
 
 ```bash
-set -x CAT_TALKER_CODER_BACKEND goose
+export CAT_TALKER_CODER_BACKEND=goose
 ```
 
 For Goose with Gemini 3.5 Flash-Lite:
 
 ```bash
-set -x CAT_TALKER_CODER_BACKEND goose-lite
+export CAT_TALKER_CODER_BACKEND=goose-lite
 ```
 
 For either Goose backend, `CAT_TALKER_GOOSE_MODEL` overrides the
