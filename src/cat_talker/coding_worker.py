@@ -52,26 +52,29 @@ VERIFY_TRUNCATION_NOTE = "\n...[verification output truncated]"
 DEFAULT_CLI_BIN = "opencode"
 DEFAULT_CLI_ARGS = ("run",)
 
-# Explicit backend selection: CAT_TALKER_CODER_BACKEND=opencode|goose.
-# OpenCode is always the default; Goose runs only when explicitly
+# Explicit backend selection:
+# CAT_TALKER_CODER_BACKEND=opencode|goose|goose-lite.
+# OpenCode is always the default; Goose variants run only when explicitly
 # requested. Anything else fails honestly (never a silent fallback).
 BACKEND_OPENCODE = "opencode"
 BACKEND_GOOSE = "goose"
-BACKENDS = (BACKEND_OPENCODE, BACKEND_GOOSE)
+BACKEND_GOOSE_LITE = "goose-lite"
+BACKENDS = (BACKEND_OPENCODE, BACKEND_GOOSE, BACKEND_GOOSE_LITE)
 GOOSE_CLI_BIN = "goose"
 GOOSE_PROVIDER = "google"
-# Validated Goose cloud model (real headless benchmark). Single source:
-# CAT_TALKER_GOOSE_MODEL overrides; never hard-code elsewhere.
+# Validated Goose cloud models. Single source:
+# CAT_TALKER_GOOSE_MODEL overrides the selected backend's default.
 GOOSE_DEFAULT_MODEL = "gemini-3.8-flash"
+GOOSE_FLASH_LITE_MODEL = "gemini-3.5-flash-lite"
 # Bounded agent iterations per task (verified `goose run --help` flag;
 # the subprocess timeout below remains the hard wall).
 GOOSE_MAX_TURNS = 25
 
 
-def resolve_goose_model() -> str:
-    """Configured Goose model, defaulting to the validated one."""
+def resolve_goose_model(default: str = GOOSE_DEFAULT_MODEL) -> str:
+    """Configured Goose model, falling back to the selected backend default."""
     configured = os.environ.get("CAT_TALKER_GOOSE_MODEL", "").strip()
-    return configured or GOOSE_DEFAULT_MODEL
+    return configured or default
 
 
 def _protected_roots() -> list:
@@ -556,7 +559,8 @@ class GooseWorkerProvider(SubprocessWorkerProvider):
 
     def __init__(self, binary: str | None = None,
                  max_turns: int = GOOSE_MAX_TURNS,
-                 timeout: int = WORKER_TIMEOUT_DEFAULT):
+                 timeout: int = WORKER_TIMEOUT_DEFAULT,
+                 model_default: str = GOOSE_DEFAULT_MODEL):
         super().__init__(binary=(binary if isinstance(binary, str)
                                  and binary.strip() else GOOSE_CLI_BIN),
                          extra_args=(), timeout=timeout)
@@ -564,7 +568,9 @@ class GooseWorkerProvider(SubprocessWorkerProvider):
             self.max_turns = max(1, min(100, int(max_turns)))
         except (TypeError, ValueError):
             self.max_turns = GOOSE_MAX_TURNS
-        self.goose_model = resolve_goose_model()
+        if not isinstance(model_default, str) or not model_default.strip():
+            model_default = GOOSE_DEFAULT_MODEL
+        self.goose_model = resolve_goose_model(model_default.strip())
 
     def _build_argv(self, resolved: str, req: WorkerRequest) -> list:
         prompt = req.task
@@ -628,6 +634,8 @@ def select_backend(name: str | None = None) -> WorkerProvider:
         cleaned = BACKEND_OPENCODE
     if cleaned == BACKEND_GOOSE:
         return GooseWorkerProvider()
+    if cleaned == BACKEND_GOOSE_LITE:
+        return GooseWorkerProvider(model_default=GOOSE_FLASH_LITE_MODEL)
     if cleaned == BACKEND_OPENCODE:
         return SubprocessWorkerProvider()
     raise ValueError(
