@@ -144,8 +144,12 @@ network).
   ids only, local-timezone interpretation, ask rather than guess.
 - Known limitations:
   - **Echo suppression/audio isolation is improved but defensive, not
-    a perfect guarantee** against loud external audio. Live-mic
-    validation across wake cycles is still real-world-pending.
+    a perfect guarantee** against loud external audio (residual edge
+    cases may remain).
+  - **Human live voice acceptance: PASS** on the real desktop — F2
+    wake, spoken desktop commands with actual desktop effects,
+    automatic idle sleep, F2 wake after sleep, immediate post-wake
+    spoken command, F3 graceful quit.
    - **Generic visual clicking is best-effort.** Grounding can miss;
      bounded by max-2-alternate retry, then the assistant asks the user.
       Requires `ydotoold` + `input` group. Backend health is explicit:

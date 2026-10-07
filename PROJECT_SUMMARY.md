@@ -217,8 +217,10 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ### Current limitations (honest, see README/PROJECT_STATUS.md for detail)
 - **Echo suppression/audio isolation** is improved but defensive, not a
-  perfect guarantee; live-mic validation across wake cycles is
-  real-world-pending.
+  perfect guarantee (residual edge cases may remain).
+- **Human live voice acceptance: PASS** on the real desktop — F2 wake,
+  spoken desktop commands with actual effects, automatic idle sleep,
+  F2 wake after sleep, immediate post-wake command, F3 graceful quit.
 - **Generic visual clicking** is best-effort (`ydotoold` + `input` group).
 - **No wake word unless enabled** (needs `openwakeword` +
   `wake_word_enabled: true`; otherwise F2 wakes); Hyprland needed

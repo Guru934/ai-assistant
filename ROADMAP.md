@@ -46,13 +46,16 @@ Completed (current GitHub checkpoint `9b2928d` with 603 automated tests passing;
 │   switching, app-open auto-hide, F1 hide/show round-trip with
 │   usable session after restore, F2 wake/listen, F3 quit;
 │   workspace changes do not auto-hide; no defects)
+├── Human live voice acceptance, human-verified PASS (F2 wake,
+│   spoken desktop commands with actual effects, automatic idle
+│   sleep, F2 wake after sleep, immediate post-wake command,
+│   F3 graceful quit)
 └── Goose opt-in coding backends (same WorkerProvider abstraction;
     secure credential handoff; `goose` → gemini-3.8-flash,
     `goose-lite` → gemini-3.5-flash-lite; one real cross-file
     production task passed with independent verification)
 
 Current phase: product acceptance, polish, real-world reliability
-├── End-to-end acceptance testing (live mic across wake cycles)
 ├── Documentation maintenance
 ├── UX/polish based on real usage
 ├── Remaining audio/echo edge cases

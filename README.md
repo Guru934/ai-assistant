@@ -261,8 +261,11 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ## Known limitations
 
 - Echo suppression/audio isolation is improved but defensive, not a
-  perfect guarantee; live-mic validation across wake cycles is still
-  real-world-pending.
+  perfect guarantee (residual edge cases may remain).
+- Human live voice acceptance: PASS on the real desktop — F2 wake,
+  spoken desktop commands with actual desktop effects, automatic
+  idle sleep, F2 wake after sleep, immediate post-wake spoken
+  command, F3 graceful quit.
 - Generic visual clicking is best-effort (`ydotoold` + `input` group,
   frame-grounded with stale refusal).
 - The optional wake word needs `openwakeword` installed and
