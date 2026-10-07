@@ -320,7 +320,8 @@ def read_aloud(text: str) -> str:
 # reuses the same spoken-approval flow as click/type/press: the first
 # call pauses for an out-loud "yes", confirm_action runs it.
 
-def run_coding_task(task: str, workspace: str = "") -> str:
+def run_coding_task(task: str, workspace: str = "",
+                    verify_command=None) -> str:
     """Delegate explicit coding work to the external coding worker.
 
     Use ONLY for clearly coding-oriented requests ('create a Python
@@ -332,12 +333,27 @@ def run_coding_task(task: str, workspace: str = "") -> str:
     claims: report results only as worker-reported unless independent
     verification passed - never claim completion the worker did not
     report, and never present worker-reported tests as verified fact.
-    Never raises: failures return honest error strings.
+    Independent verification runs ONLY the exact verify_command given
+    here (argv list, e.g. ["python3", "test_calc.py"]) - never invent,
+    infer, guess, or substitute one. If the user asks for independent
+    verification but has not named the exact command, do NOT call this
+    tool yet: ask which exact command to run. Without verify_command,
+    verification stays unknown and worker-run tests are never promoted
+    to independent verification. Never raises: failures return honest
+    error strings.
+
+    Args:
+        task: Coding task description (required, non-empty).
+        workspace: Explicit repository path (required).
+        verify_command: Optional exact verification argv (list of
+            non-empty strings, no shell). Only ever what was
+            explicitly requested, never inferred.
     """
-    def _execute(task, workspace):
+    def _execute(task, workspace, verify_command=None):
         try:
             from cat_talker.coding_worker import build_request, delegate
-            return delegate(build_request(workspace, task))
+            return delegate(build_request(workspace, task,
+                                          verify_command=verify_command))
         except Exception as e:
             return f"Coding task FAILED.\nError: {e}"
 
@@ -352,7 +368,8 @@ def run_coding_task(task: str, workspace: str = "") -> str:
     except Exception as e:
         return f"Coding task FAILED.\nError: {e}"
     return _handle_risky("run_coding_task", _execute,
-                         {"task": task, "workspace": workspace},
+                         {"task": task, "workspace": workspace,
+                          "verify_command": verify_command},
                          "delegate this coding task to the coding worker")
 
 

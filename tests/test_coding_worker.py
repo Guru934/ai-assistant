@@ -1429,3 +1429,119 @@ def test_worker_argv_still_binds_own_binary_dir(tmp_path, monkeypatch):
              for i, a in enumerate(argv[:-2])
              if a == "--ro-bind"]
     assert ("/home/guru/.local/bin", "/home/guru/.local/bin") in pairs
+
+
+# ─── run_coding_task verify_command contract ─────────────────────────
+
+def test_tool_schema_exposes_verify_command():
+    import inspect
+    from cat_talker.tools import run_coding_task
+    params = inspect.signature(run_coding_task).parameters
+    assert "verify_command" in params
+    assert params["verify_command"].default is None
+    doc = run_coding_task.__doc__ or ""
+    assert "verify_command" in doc
+    assert "never invent" in doc.lower()
+
+
+def test_explicit_verify_command_reaches_request(tmp_path, monkeypatch):
+    seen = {}
+    real_build = cw.build_request
+
+    def _spy(workspace, task, **kwargs):
+        seen["verify_command"] = kwargs.get("verify_command")
+        return real_build(workspace, task, **kwargs)
+
+    monkeypatch.setattr(cw, "build_request", _spy)
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _FakePopen(out="done"))
+    req = cw.build_request(str(tmp_path), "fix bug",
+                           verify_command=["python3", "test_calc.py"])
+    assert req.verify_command == ("python3", "test_calc.py")
+    out = cw.delegate(req)
+    assert isinstance(out, str)
+
+
+def test_verify_command_accepted_form(tmp_path):
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=["python3", "test_calc.py"])
+    assert req.verify_command == ("python3", "test_calc.py")
+
+
+def test_verify_command_empty_argv_rejected(tmp_path):
+    with pytest.raises(ValueError, match="verify_command"):
+        build_request(str(tmp_path), "fix bug", verify_command=[])
+
+
+def test_verify_command_empty_elements_rejected(tmp_path):
+    with pytest.raises(ValueError, match="verify_command"):
+        build_request(str(tmp_path), "fix bug",
+                      verify_command=["python3", "  "])
+
+
+def test_no_verify_command_preserves_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _FakePopen(
+                            out="Ran 6 tests, all passed", code=0))
+    req = build_request(str(tmp_path), "fix bug")
+    assert req.verify_command is None
+    result = SubprocessWorkerProvider().run(req)
+    assert result.ok is True
+    verified = cw.verify_result(req, result)
+    assert verified.verification == "unknown"
+    assert "NOT independently verified" in verified.render()
+
+
+def test_guidance_says_ask_rather_than_infer():
+    text = build_system_instructions()
+    assert "ask which exact command to run" in text
+    assert "never invent, infer, guess" in text.lower()
+
+
+def test_worker_tests_never_promoted_without_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _FakePopen(
+                            out="Ran 6 tests, all 6 tests passed", code=0))
+    from cat_talker.tools import confirm_action, run_coding_task
+    import cat_talker.tools as tools_mod
+    saved = tools_mod.PENDING_RISKY_ACTION
+    tools_mod.PENDING_RISKY_ACTION = None
+    try:
+        paused = run_coding_task("fix bug", str(tmp_path))
+        assert "PAUSED FOR SAFETY" in paused
+        out = confirm_action()
+        assert "verification was not available" in out
+        assert "Tests: independently verified." not in out
+        assert "UNVERIFIED" in out
+    finally:
+        tools_mod.PENDING_RISKY_ACTION = saved
+
+
+def test_sandboxed_verify_uses_bwrap_boundary_with_command(tmp_path,
+                                                           monkeypatch):
+    target = os.path.join(str(tmp_path), "a.py")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    seen = {}
+    real_which = cw.shutil.which
+
+    def _capture(argv, **kwargs):
+        seen["argv"] = argv
+        return _FakePopen(out="ok", code=0)
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=["true"])
+    record = cw.WorkerResult(ok=True, summary="fixed",
+                             files_changed=["a.py"])
+    verified = cw.verify_result(req, record, sandbox="bwrap")
+    assert verified.verification == "independently_verified_pass"
+    assert seen["argv"][0] == real_which("bwrap")
+    assert "--" in seen["argv"]
+    assert seen["argv"][-1] == "true"
