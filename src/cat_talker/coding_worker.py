@@ -415,7 +415,11 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
             argv, env, cleanup = cmd_list, None, None
         elif sandbox == "bwrap":
             home = _make_sandbox_home()
-            argv, env = _bwrap_wrap(cmd_list, workspace, home, None)
+            # No binary-dir binding here: verification commands must
+            # already live in /usr or the workspace, otherwise they
+            # fail honestly instead of punching holes (see _bwrap_wrap).
+            argv, env = _bwrap_wrap(cmd_list, workspace, home, None,
+                                    bind_binary_dir=False)
             cleanup = lambda: shutil.rmtree(home, ignore_errors=True)
         else:
             result.verification = "unknown"
@@ -540,12 +544,18 @@ def _sandbox_env(base_env) -> dict:
 
 
 def _bwrap_wrap(inner_argv, workspace: str, home: str,
-                base_env) -> tuple:
+                base_env, bind_binary_dir: bool = True) -> tuple:
     """Wrap inner_argv (list, after --) for bubblewrap confinement.
 
     Returns (argv, env). Pure construction (no execution) so tests
     assert the exact boundary. Raises ValueError when bwrap is
     missing (fail closed: the caller must not run unsandboxed).
+
+    bind_binary_dir ro-binds argv[0]'s directory so the process can
+    execute. True for the Chibi-chosen worker binary; False for
+    verification commands, which must live in /usr or the workspace —
+    otherwise an absolute outside path would punch its own directory
+    into the sandbox.
     """
     bwrap = shutil.which(BWRAP_BIN)
     if not bwrap:
@@ -570,23 +580,25 @@ def _bwrap_wrap(inner_argv, workspace: str, home: str,
         "--bind", workspace, workspace,
         "--bind", home, home,
     ]
-    # The worker binary itself must be visible: CLIs outside /usr
-    # (e.g. ~/.local/bin) get their containing directory bound
-    # read-only. Relative commands resolve inside the workspace.
+    # The worker binary itself must be visible (bind_binary_dir=True
+    # only): CLIs outside /usr (e.g. ~/.local/bin) get their
+    # containing directory bound read-only. Relative commands resolve
+    # inside the workspace. Verification passes False (see below).
     binary = inner_argv[0] if inner_argv else ""
-    if os.path.isabs(binary):
-        bindir = os.path.dirname(binary)
-        if bindir and bindir != "/usr/bin":
-            argv += ["--ro-bind", bindir, bindir]
-    elif os.path.basename(binary) != binary:
-        pass  # relative path: resolved against cwd=workspace (bound)
-    else:
-        located = shutil.which(binary)
-        if located:
-            bindir = os.path.dirname(located)
-            if bindir != "/usr/bin":
+    if bind_binary_dir:
+        if os.path.isabs(binary):
+            bindir = os.path.dirname(binary)
+            if bindir and bindir != "/usr/bin":
                 argv += ["--ro-bind", bindir, bindir]
-        # else: spawn fails honestly inside the sandbox (exit 127).
+        elif os.path.basename(binary) != binary:
+            pass  # relative: resolved against cwd=workspace (bound)
+        else:
+            located = shutil.which(binary)
+            if located:
+                bindir = os.path.dirname(located)
+                if bindir != "/usr/bin":
+                    argv += ["--ro-bind", bindir, bindir]
+            # else: spawn fails honestly inside the sandbox (exit 127).
     argv += [
         "--chdir", workspace,
         "--die-with-parent",

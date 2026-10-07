@@ -1311,3 +1311,59 @@ def test_live_workspace_file_roundtrip_via_provider(tmp_path, monkeypatch):
         build_request(str(tmp_path), "read the file"))
     assert result.ok is True
     assert "sandbox-hello" in result.summary
+
+
+def test_verify_absolute_outside_binary_fails_without_binding(
+        tmp_path, monkeypatch):
+    import pathlib
+    outside = os.path.join(str(tmp_path), "..",
+                           "rt-host-only-verify-test")
+    outside = os.path.realpath(outside)
+    os.makedirs(outside, exist_ok=True)
+    script = os.path.join(outside, "probe.sh")
+    pathlib.Path(script).write_text("#!/bin/sh\necho HOST-ESCAPE\n",
+                                    encoding="utf-8")
+    seen = {}
+
+    def _capture(argv, **kwargs):
+        seen["argv"] = argv
+        return _FakePopen(out="should-not-run", code=0)
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=[script])
+    record = cw.WorkerResult(ok=True, summary="fixed",
+                             files_changed=[])
+    home = cw._make_sandbox_home()
+    try:
+        argv, _ = cw._bwrap_wrap([script],
+                                 os.path.realpath(str(tmp_path)),
+                                 home, None, bind_binary_dir=False)
+        assert outside not in argv, \
+            "verify binding punches outside dir into sandbox"
+    finally:
+        __import__("shutil").rmtree(home, ignore_errors=True)
+
+
+def test_worker_argv_still_binds_own_binary_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: "/usr/bin/bwrap"
+                        if name == "bwrap" else "/home/guru/.local/bin/goose")
+    captured = {}
+
+    def _capture(argv, **kwargs):
+        captured["argv"] = argv
+        return _FakePopen(out="done")
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    BubblewrapWorkerProvider(GooseWorkerProvider()).run(
+        build_request(str(tmp_path), "fix bug"))
+    argv = captured["argv"]
+    assert "--ro-bind" in argv
+    idx = argv.index("--ro-bind")
+    pairs = [(argv[i + 1], argv[i + 2])
+             for i, a in enumerate(argv[:-2])
+             if a == "--ro-bind"]
+    assert ("/home/guru/.local/bin", "/home/guru/.local/bin") in pairs
