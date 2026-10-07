@@ -267,6 +267,8 @@ def test_confirm_executes_and_reports_truth(tmp_path, monkeypatch,
                                             _clean_pending):
     from cat_talker.tools import confirm_action, run_coding_task
     (tmp_path / "app.py").write_text("# worker made this\n")
+    # Explicit unsandboxed mode (see test_confirm_reports_failure_honestly).
+    monkeypatch.setenv("CAT_TALKER_CODER_SANDBOX", "none")
     monkeypatch.setattr(
         SubprocessWorkerProvider, "run",
         lambda self, req: WorkerResult(ok=True, summary="added logging",
@@ -284,6 +286,10 @@ def test_confirm_executes_and_reports_truth(tmp_path, monkeypatch,
 def test_confirm_reports_failure_honestly(tmp_path, monkeypatch,
                                           _clean_pending):
     from cat_talker.tools import confirm_action, run_coding_task
+    # Explicit unsandboxed mode: this test stubs SubprocessWorkerProvider
+    # .run, which a sandbox wrapper legitimately bypasses (it
+    # reimplements spawning around inner argv, by design).
+    monkeypatch.setenv("CAT_TALKER_CODER_SANDBOX", "none")
     monkeypatch.setattr(
         SubprocessWorkerProvider, "run",
         lambda self, req: WorkerResult(ok=False, error="tests red"))
@@ -982,8 +988,8 @@ def _sandboxed(opencode=True, **kwargs):
 
 
 # A: sandbox=none keeps exact existing behavior -------------------------
-def test_sandbox_none_is_default_and_passthrough(tmp_path, monkeypatch):
-    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+def test_sandbox_none_is_explicit_passthrough(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_SANDBOX", "none")
     assert select_sandbox() == "none"
     engine = maybe_sandbox(SubprocessWorkerProvider())
     assert type(engine) is SubprocessWorkerProvider
@@ -992,6 +998,20 @@ def test_sandbox_none_is_default_and_passthrough(tmp_path, monkeypatch):
     assert result.ok is True
     assert seen["argv"][0] == "/usr/bin/opencode"
     assert "bwrap" not in seen["argv"][0]
+
+
+def test_sandbox_default_is_bwrap(tmp_path, monkeypatch):
+    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+    assert select_sandbox() == "bwrap"
+    engine = maybe_sandbox(SubprocessWorkerProvider())
+    assert isinstance(engine, BubblewrapWorkerProvider)
+
+
+def test_sandbox_explicit_bwrap_selects_bwrap(monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_SANDBOX", "bwrap")
+    assert select_sandbox() == "bwrap"
+    engine = maybe_sandbox(SubprocessWorkerProvider())
+    assert isinstance(engine, BubblewrapWorkerProvider)
 
 
 def test_sandbox_invalid_fails_closed(tmp_path, monkeypatch):

@@ -2,11 +2,11 @@
 
 Checkpoint: **`9b2928d`** — *Merge feat/goose-gemini-35-flash-lite
 into main* (the latest code/test checkpoint, automated suite
-619 passed; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`,
+623 passed; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`,
 `f4514ae` — full chain back through `5ee950c`).
 Working tree matches the checkpoint except untracked `.vscode/`
 (IDE state, not project source); everything below is implemented,
-unit-tested (619 passed via `./.venv/bin/python -m pytest -q` at the
+unit-tested (623 passed via `./.venv/bin/python -m pytest -q` at the
 `9b2928d` code checkpoint, plus human-verified live-desktop
 acceptance), and committed. No hardware,
 network, speakers, or credentials needed for the suite (fakes for
@@ -165,8 +165,8 @@ network).
    - **No wake word unless enabled:** without `openwakeword` +
      `wake_word_enabled: true`, F2 is the wake mechanism; Hyprland needed
      for global keys; needs network + valid Gemini API key.
-  - **The coding worker has an opt-in bubblewrap sandbox
-    (`CAT_TALKER_CODER_SANDBOX=bwrap`, default off).** Unsandboxed, the
+  - **The coding worker runs sandboxed by default under bubblewrap
+    (`CAT_TALKER_CODER_SANDBOX=bwrap` default; `none` is an explicit compatibility escape hatch).** Unsandboxed (explicit `none`), the
     boundary is validation + cwd/`--dir` scoping + approval +
     verification; a compromised same-UID worker process could
     theoretically escape it. Sandboxed, the worker sees only the
@@ -197,7 +197,7 @@ network).
     were exhausted during earlier validation; no billing touched),
     stays opt-in with OpenCode remaining the default, and broader
     multi-file robustness still needs post-quota production work.
-    Neither backend is sandboxed by default; the opt-in bwrap
+    Neither backend is sandboxed when explicitly set to `none`; the bwrap
     sandbox (above) is confinement, not a kernel boundary.
 - Future work (acceptance phase, not architecture rewrites):
   end-to-end real-world acceptance testing, documentation upkeep,

@@ -1,4 +1,4 @@
-Completed (current GitHub checkpoint `9b2928d` with 619 automated tests passing; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`, `f4514ae`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
+Completed (current GitHub checkpoint `9b2928d` with 623 automated tests passing; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`, `f4514ae`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
 ├── Core voice assistant
 ├── Gemini Live lifecycle
 ├── OS controls
@@ -54,9 +54,9 @@ Completed (current GitHub checkpoint `9b2928d` with 619 automated tests passing;
 │   secure credential handoff; `goose` → gemini-3.8-flash,
 │   `goose-lite` → gemini-3.5-flash-lite; one real cross-file
 │   production task passed with independent verification)
-├── Opt-in bubblewrap worker sandbox (workspace-only view, throwaway
-│   HOME, private /tmp, shared network, fail-closed; verification
-│   inside the same boundary)
+├── Bubblewrap worker sandbox, on by default (workspace-only view,
+│   throwaway HOME, private /tmp, shared network, fail-closed;
+│   verification inside the same boundary; `none` escape hatch)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── Documentation maintenance

@@ -478,7 +478,7 @@ class WorkerProvider:
         raise NotImplementedError
 
 
-# ─── bubblewrap sandbox (explicit opt-in) ──────────────────────────
+# ─── bubblewrap sandbox (default; explicit escape hatch) ─────────
 #
 # Boundary: the worker sees ONLY the validated workspace (writable)
 # plus a throwaway HOME/XDG area and a private /tmp. The real home
@@ -859,13 +859,14 @@ class BubblewrapWorkerProvider(WorkerProvider):
 
 
 def select_sandbox(name: str | None = None) -> str:
-    """Sandbox mode: 'none' default, 'bwrap' explicit opt-in. Raises
-    ValueError on anything else (fail closed, never silent)."""
+    """Sandbox mode: 'bwrap' default, 'none' explicit compatibility
+    escape hatch. Raises ValueError on anything else (fail closed,
+    never silent)."""
     cleaned = (name if isinstance(name, str) and name.strip()
                else os.environ.get("CAT_TALKER_CODER_SANDBOX", "")
                ).strip().lower()
     if not cleaned:
-        cleaned = SANDBOX_NONE
+        cleaned = SANDBOX_BWRAP
     if cleaned not in SANDBOX_MODES:
         raise ValueError(
             f"Coding error: unknown coder sandbox '{cleaned}'. "
@@ -875,11 +876,13 @@ def select_sandbox(name: str | None = None) -> str:
 
 def maybe_sandbox(provider: WorkerProvider,
                   mode: str | None = None) -> WorkerProvider:
-    """Wrap a subprocess backend in bubblewrap when requested."""
+    """Wrap a subprocess backend in bubblewrap unless explicitly
+    disabled. Custom (non-subprocess) providers are left alone."""
     if select_sandbox(mode) == SANDBOX_BWRAP:
         if isinstance(provider, BubblewrapWorkerProvider):
             return provider
-        return BubblewrapWorkerProvider(provider)
+        if isinstance(provider, SubprocessWorkerProvider):
+            return BubblewrapWorkerProvider(provider)
     return provider
 
 
