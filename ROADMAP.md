@@ -1,4 +1,4 @@
-Completed (current GitHub checkpoint `9b2928d` with 603 automated tests passing; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`, `f4514ae`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
+Completed (current GitHub checkpoint `9b2928d` with 619 automated tests passing; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`, `f4514ae`, `ddcf750`, `47039dd`, `dfac8f0`, `dc95c62`, `ae92f80`, `b72d466`, `64ad9d9`, `9e88759`, `69b3b63`, `5cfb01b`, `9058e57`, `ec7276f`, `5ee950c`)
 ├── Core voice assistant
 ├── Gemini Live lifecycle
 ├── OS controls
@@ -50,16 +50,19 @@ Completed (current GitHub checkpoint `9b2928d` with 603 automated tests passing;
 │   spoken desktop commands with actual effects, automatic idle
 │   sleep, F2 wake after sleep, immediate post-wake command,
 │   F3 graceful quit)
-└── Goose opt-in coding backends (same WorkerProvider abstraction;
-    secure credential handoff; `goose` → gemini-3.8-flash,
-    `goose-lite` → gemini-3.5-flash-lite; one real cross-file
-    production task passed with independent verification)
+├── Goose opt-in coding backends (same WorkerProvider abstraction;
+│   secure credential handoff; `goose` → gemini-3.8-flash,
+│   `goose-lite` → gemini-3.5-flash-lite; one real cross-file
+│   production task passed with independent verification)
+├── Opt-in bubblewrap worker sandbox (workspace-only view, throwaway
+│   HOME, private /tmp, shared network, fail-closed; verification
+│   inside the same boundary)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── Documentation maintenance
 ├── UX/polish based on real usage
 ├── Remaining audio/echo edge cases
-└── Worker sandboxing improvements if needed
+└── Worker sandbox hardening beyond bwrap confinement if needed
 
 Later (genuinely future, not implemented)
 ├── Dedicated computer-use model

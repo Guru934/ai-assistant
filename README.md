@@ -251,9 +251,14 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
   need re-approval after 120 s.
 - Coding worker: explicit workspace only, argv-only bounded execution,
   protected assistant paths (`~/.config/cat-talker`, history) denied
-  everywhere, outside-workspace report paths dropped — but there is **no
-  OS-level sandbox**: a compromised same-UID worker process could
-  theoretically escape. Verification is independent of worker claims.
+  everywhere, outside-workspace report paths dropped — and an opt-in
+  bubblewrap sandbox (`CAT_TALKER_CODER_SANDBOX=bwrap`, off by
+  default): the worker then sees only the workspace (writable), a
+  throwaway HOME, and a private /tmp — never the real home, host
+  /tmp, SSH keys, browser profiles, or desktop IPC. Network stays
+  shared (cloud CLIs need it); missing bwrap fails closed, never
+  unsandboxed. This is filesystem/process confinement, not a kernel
+  security boundary. Verification is independent of worker claims.
 - Fetched web content is UNTRUSTED DATA (summarize, never obey).
 - Memory writes are explicit only; secrets are never special-cased into
   preferences.
@@ -271,7 +276,9 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 - The optional wake word needs `openwakeword` installed and
   `wake_word_enabled: true`; otherwise F2 wakes. Hyprland needed for
   global keys; needs network + a valid Gemini key.
-- Coding worker has no OS sandbox (see above); worker-reported tests
+- Coding worker has an opt-in bubblewrap sandbox
+  (`CAT_TALKER_CODER_SANDBOX=bwrap`, default off); unsandboxed runs
+  have no OS sandbox (see above); worker-reported tests
   are claims until independently verified.
 - `read_aloud` needs `espeak-ng`, else honest failure.
 - Reminders fire only while the Chibi process runs (no daemon
@@ -290,7 +297,7 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-603 passed, no hardware or network needed (fakes for Live sessions,
+619 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
 computer-use grounding + stale-frame protection + multi-step context,
@@ -299,11 +306,11 @@ window lifecycle, shutdown, voice config (VAD/hints/guard), wake
 word, tray + bubble UI, settings, secure credentials + migration,
 reminders (store, scheduler, contract), Goose opt-in backend +
 credential handoff, media watcher, web info, Weather, Memory, TTS, assistant text
-stream, coding worker + verification, workspace switching
+stream, coding worker + verification + sandbox, workspace switching
 (user-facing 1–6), auto-hide visibility behavior, diagnostics, and
 packaging.
 
-Current state: automated suite 603 passed at the `9b2928d` code
+Current state: automated suite 619 passed at the `9b2928d` code
 checkpoint (current GitHub main); live desktop acceptance
 human-verified PASS (workspace 5/6, app-open auto-hide, F1 restore,
 F2 wake/listen, F3 quit; no defects) — recorded separately from the

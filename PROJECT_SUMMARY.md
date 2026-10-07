@@ -48,10 +48,10 @@ A local, privacy-first desktop AI assistant with real-time voice, vision, and OS
 - **Settings Persistence** - API key, preferred monitor, auto-reconnect, voice approval saved to `~/.config/cat-talker/config.json`
 - **Modular Design** - Cleanly separated audio, vision, config, logging, and AI modules
 - **Structured Logging** - All modules use structured logging (DEBUG/INFO/WARNING/ERROR)
-- **Unit Tests** - 603 tests covering lifecycle, audio, sleep/wake,
+- **Unit Tests** - 619 tests covering lifecycle, audio, sleep/wake,
   control/launch, vision, tools, grounding + stale-frame protection +
   multi-step context, web info, Weather, Memory, TTS, assistant text
-  stream, coding worker + verification, reminders (store, scheduler,
+  stream, coding worker + verification + sandbox, reminders (store, scheduler,
   firing, contract), workspace switching (1–6),
   auto-hide visibility, tray + bubble UI, wake word, settings, secure
   credentials + migration, ydotool health/setup, diagnostics (see
@@ -208,7 +208,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 ## Test Results
 ```bash
 ./.venv/bin/python -m pytest -q
-# 603 passed — no hardware, network, speakers, or credentials needed
+# 619 passed — no hardware, network, speakers, or credentials needed
 # (fakes for Live sessions, audio, vision, Qt offscreen, playerctl,
 # subprocess, network). See README "How to run tests" for coverage.
 ```
@@ -225,7 +225,10 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 - **No wake word unless enabled** (needs `openwakeword` +
   `wake_word_enabled: true`; otherwise F2 wakes); Hyprland needed
   for global keys; needs network + valid Gemini API key.
-- **Coding worker has no OS-level sandbox**; worker-reported tests are
+- **Coding worker has an opt-in bubblewrap sandbox**
+  (`CAT_TALKER_CODER_SANDBOX=bwrap`, default off; workspace-only
+  view, throwaway HOME, private /tmp, shared network, fail-closed);
+  worker-reported tests are
   claims until independently verified. Goose/Cloud Gemini is
   quota/cost-gated (free-tier exhausted during validation); broader
   multi-file robustness still needs post-quota production work.
@@ -256,7 +259,7 @@ Optional: `export LOG_LEVEL=DEBUG` for verbose logging.
 
 ---
 
-*Last verified: 2026-10-06 — automated suite 603 passing at the
+*Last verified: 2026-10-06 — automated suite 619 passing at the
 `9b2928d` code checkpoint (current GitHub main), which additionally
 records the live-desktop acceptance human-verified PASS (separate
 from the automated suite).

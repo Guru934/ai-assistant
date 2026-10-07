@@ -964,3 +964,350 @@ def test_opencode_env_passthrough_unchanged(tmp_path, monkeypatch):
     assert seen["kwargs"]["env"] is None
     assert "--provider" not in seen["argv"]
     assert "--model" not in seen["argv"]
+
+
+# ─── bubblewrap sandbox (explicit opt-in) ────────────────────────────
+
+from cat_talker.coding_worker import (
+    BubblewrapWorkerProvider,
+    maybe_sandbox,
+    select_sandbox,
+)
+
+
+def _sandboxed(opencode=True, **kwargs):
+    inner = (SubprocessWorkerProvider(**kwargs) if opencode
+             else GooseWorkerProvider(**kwargs))
+    return BubblewrapWorkerProvider(inner)
+
+
+# A: sandbox=none keeps exact existing behavior -------------------------
+def test_sandbox_none_is_default_and_passthrough(tmp_path, monkeypatch):
+    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+    assert select_sandbox() == "none"
+    engine = maybe_sandbox(SubprocessWorkerProvider())
+    assert type(engine) is SubprocessWorkerProvider
+    seen = _mock_popen(monkeypatch)
+    result = engine.run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    assert seen["argv"][0] == "/usr/bin/opencode"
+    assert "bwrap" not in seen["argv"][0]
+
+
+def test_sandbox_invalid_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("CAT_TALKER_CODER_SANDBOX", "docker")
+    with pytest.raises(ValueError, match="unknown coder sandbox"):
+        maybe_sandbox(SubprocessWorkerProvider())
+
+
+# B: bwrap argv shape ----------------------------------------------------
+def test_bwrap_argv_isolation_shape(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: "/usr/bin/bwrap"
+                        if name == "bwrap" else "/usr/bin/opencode")
+    captured = {}
+
+    class _NoExecPopen(_FakePopen):
+        pass
+
+    orig_popen = cw.subprocess.Popen
+
+    def _capture(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return _FakePopen(out="done")
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    result = _sandboxed().run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    argv = captured["argv"]
+    assert argv[0] == "/usr/bin/bwrap"
+    assert "--unshare-user" in argv and "--die-with-parent" in argv
+    assert "--tmpfs" in argv and "/tmp" in argv
+    sep = argv.index("--")
+    inner = argv[sep + 1:]
+    assert inner[0] == "/usr/bin/opencode"
+    assert "--dir" in inner
+    # Confined mounts: workspace bound, home is a throwaway dir.
+    ws = os.path.realpath(str(tmp_path))
+    assert ws in argv
+    home_idx = argv.index(ws) + 1  # placeholder check below
+    assert captured["kwargs"]["cwd"] == ws
+    assert captured["kwargs"]["env"]["HOME"] != os.path.expanduser("~")
+    assert "shell" not in captured["kwargs"]
+    assert orig_popen is not None
+
+
+def test_bwrap_no_network_namespace_flag(tmp_path, monkeypatch):
+    # Documented policy: network is shared so cloud CLIs keep working.
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: "/usr/bin/bwrap"
+                        if name == "bwrap" else "/usr/bin/opencode")
+    captured = {}
+
+    def _capture(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return _FakePopen(out="done")
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    _sandboxed().run(build_request(str(tmp_path), "fix bug"))
+    assert "--unshare-net" not in captured["argv"]
+    assert "--unshare-all" not in captured["argv"]
+
+
+# C: missing bwrap fails closed, provider never runs ----------------------
+def test_bwrap_missing_fails_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: None if name == "bwrap"
+                        else "/usr/bin/opencode")
+    started = []
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: started.append((a, k)))
+    result = _sandboxed().run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is False
+    assert "bwrap" in result.error
+    assert started == [], "worker ran without the requested sandbox"
+
+
+def test_bwrap_home_cleanup_on_failure(tmp_path, monkeypatch):
+    made = []
+    real_make_home = cw._make_sandbox_home
+
+    def _track():
+        path = real_make_home()
+        made.append(path)
+        return path
+
+    monkeypatch.setattr(cw, "_make_sandbox_home", _track)
+    monkeypatch.setattr(cw.shutil, "which", lambda _: None)
+    result = _sandboxed().run(build_request(str(tmp_path), "fix bug"))
+    assert result.ok is False
+    assert "not installed" in result.error
+    # Fail-closed before allocating anything: no home created, none leaked.
+    assert made == []
+    for path in made:
+        assert not os.path.exists(path), f"sandbox home leaked: {path}"
+
+
+# H: environment isolation -------------------------------------------------
+def test_bwrap_env_isolation(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "real-chibi-key-must-not-pass")
+    monkeypatch.setenv("DISPLAY", ":9")
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-9")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
+    captured = {}
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: "/usr/bin/bwrap"
+                        if name == "bwrap" else "/usr/bin/opencode")
+
+    def _capture(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakePopen(out="done")
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    _sandboxed().run(build_request(str(tmp_path), "fix bug"))
+    env = captured["env"]
+    assert "GEMINI_API_KEY" not in env
+    assert "DISPLAY" not in env and "WAYLAND_DISPLAY" not in env
+    assert "SSH_AUTH_SOCK" not in env
+    assert "DBUS_SESSION_BUS_ADDRESS" not in env
+    assert env["HOME"] != os.path.expanduser("~")
+    assert env["TMPDIR"] == "/tmp"
+    assert env["XDG_CONFIG_HOME"].startswith(env["HOME"])
+    assert "PATH" in env
+
+
+def test_bwrap_goose_credential_only_google_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "real-chibi-key-must-not-pass")
+    captured = {}
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: "/usr/bin/bwrap"
+                        if name == "bwrap" else "/home/guru/.local/bin/goose")
+
+    def _capture(argv, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakePopen(out="done")
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    result = _sandboxed(opencode=False).run(
+        build_request(str(tmp_path), "fix bug"))
+    assert result.ok is True
+    env = captured["env"]
+    assert env["GOOGLE_API_KEY"] == "fake-test-key"
+    assert "GEMINI_API_KEY" not in env
+
+
+# I: timeout kills the wrapped tree -----------------------------------------
+def test_bwrap_timeout_kills_tree(tmp_path, monkeypatch):
+    _mock_popen(monkeypatch, binary="/usr/bin/opencode")
+    killed = []
+
+    class _Hanging(_FakePopen):
+        def communicate(self, timeout=5):
+            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _Hanging())
+    monkeypatch.setattr(cw.os, "killpg",
+                        lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(cw.os, "getpgid", lambda pid: 777)
+    result = _sandboxed().run(
+        build_request(str(tmp_path), "slow", timeout=5))
+    assert result.ok is False
+    assert "timed out" in result.error
+    assert killed, "sandboxed process group was not cleaned up"
+
+
+# J: verification uses the same boundary --------------------------------------
+def test_verify_through_bwrap_boundary(tmp_path, monkeypatch):
+    target = os.path.join(str(tmp_path), "fixed.py")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    seen = {}
+
+    def _capture(argv, **kwargs):
+        seen["argv"] = argv
+        return _FakePopen(out="ok", code=0)
+
+    monkeypatch.setattr(cw.subprocess, "Popen", _capture)
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=["true"])
+    record = cw.WorkerResult(ok=True, summary="fixed",
+                             files_changed=["fixed.py"],
+                             tests_passed=True)
+    verified = cw.verify_result(req, record, sandbox="bwrap")
+    assert verified.verification == "independently_verified_pass"
+    assert seen["argv"][0] == "/usr/bin/bwrap"
+    assert "--" in seen["argv"]
+    assert seen["argv"][-1] == "true"
+
+
+def test_verify_unknown_sandbox_fails_closed(tmp_path):
+    target = os.path.join(str(tmp_path), "fixed.py")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=["true"])
+    record = cw.WorkerResult(ok=True, summary="fixed",
+                             files_changed=["fixed.py"])
+    verified = cw.verify_result(req, record, sandbox="lxc")
+    assert verified.verification == "unknown"
+    assert "misconfigured" in verified.error
+
+
+def test_delegate_routes_verify_through_sandbox(tmp_path, monkeypatch):
+    target = os.path.join(str(tmp_path), "fixed.py")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("x = 1\n")
+    calls = []
+    real_verify = cw.verify_result
+
+    def _spy(req, result, sandbox=None):
+        calls.append(sandbox)
+        return real_verify(req, result, sandbox=sandbox)
+
+    monkeypatch.setattr(cw, "verify_result", _spy)
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _FakePopen(out="ok", code=0))
+    req = build_request(str(tmp_path), "fix bug",
+                        verify_command=["true"])
+    out = cw.delegate(
+        req, provider=BubblewrapWorkerProvider(
+            SubprocessWorkerProvider()))
+    assert calls == ["bwrap"]
+    assert "independently verified" in out
+
+
+# K: backends still select with sandbox off --------------------------------------
+def test_backends_select_with_sandbox_off(tmp_path, monkeypatch):
+    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+    monkeypatch.delenv("CAT_TALKER_CODER_BACKEND", raising=False)
+    assert isinstance(cw.select_backend(), SubprocessWorkerProvider)
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", "goose")
+    assert isinstance(cw.select_backend(), cw.GooseWorkerProvider)
+    monkeypatch.setenv("CAT_TALKER_CODER_BACKEND", "goose-lite")
+    assert cw.select_backend().goose_model == "gemini-3.5-flash-lite"
+
+
+# L: guarded live-bwrap probes ---------------------------------------------------
+_bwrap_present = __import__("shutil").which("bwrap") is not None
+needs_bwrap = pytest.mark.skipif(not _bwrap_present,
+                                 reason="bwrap unavailable on this machine")
+
+
+@needs_bwrap
+def test_live_home_inaccessible(tmp_path):
+    home = cw._make_sandbox_home()
+    try:
+        argv, env = cw._bwrap_wrap(
+            ["/usr/bin/test", "!", "-e",
+             os.path.expanduser("~/.config/cat-talker/config.json")],
+            os.path.realpath(str(tmp_path)), home, None)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        out, _ = proc.communicate(timeout=30)
+        assert proc.returncode == 0, \
+            f"host assistant config visible inside sandbox: {out}"
+    finally:
+        __import__("shutil").rmtree(home, ignore_errors=True)
+
+
+@needs_bwrap
+def test_live_host_tmp_inaccessible_workspace_writable(tmp_path):
+    import pathlib
+    sentinel = "/tmp/cat-talker-sandbox-probe-sentinel"
+    pathlib.Path(sentinel).write_text("host", encoding="utf-8")
+    home = cw._make_sandbox_home()
+    try:
+        argv, env = cw._bwrap_wrap(
+            ["/usr/bin/sh", "-c",
+             "test ! -e /tmp/cat-talker-sandbox-probe-sentinel && "
+             "echo sealed-ok && echo data > ./probe-write.txt && "
+             "test \"$(cat ./probe-write.txt)\" = data && echo rw-ok"],
+            os.path.realpath(str(tmp_path)), home, None)
+        merged = dict(env)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                cwd=os.path.realpath(str(tmp_path)),
+                                env=merged)
+        out, _ = proc.communicate(timeout=30)
+        assert proc.returncode == 0, f"sandbox probe failed: {out}"
+        assert "sealed-ok" in out and "rw-ok" in out
+        assert (pathlib.Path(str(tmp_path)) / "probe-write.txt"
+                ).read_text(encoding="utf-8").strip() == "data"
+    finally:
+        __import__("shutil").rmtree(home, ignore_errors=True)
+        try:
+            os.unlink(sentinel)
+        except OSError:
+            pass
+        try:
+            os.unlink(os.path.join(str(tmp_path), "probe-write.txt"))
+        except OSError:
+            pass
+
+
+@needs_bwrap
+def test_live_workspace_file_roundtrip_via_provider(tmp_path, monkeypatch):
+    seen = {}
+    real_which = cw.shutil.which
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: ("/usr/bin/bwrap" if name == "bwrap"
+                                      else real_which(name)))
+
+    class _CatProvider(SubprocessWorkerProvider):
+        def _build_argv(self, resolved, req):
+            return ["/usr/bin/cat", "hello.txt"]
+
+    with open(os.path.join(str(tmp_path), "hello.txt"), "w",
+              encoding="utf-8") as f:
+        f.write("sandbox-hello\n")
+    result = BubblewrapWorkerProvider(_CatProvider()).run(
+        build_request(str(tmp_path), "read the file"))
+    assert result.ok is True
+    assert "sandbox-hello" in result.summary

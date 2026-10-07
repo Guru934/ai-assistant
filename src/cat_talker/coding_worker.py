@@ -374,7 +374,8 @@ def result_from_process(returncode: int, stdout: str, stderr: str,
                             verification="unknown")
 
 
-def verify_result(request: WorkerRequest, result: WorkerResult) -> WorkerResult:
+def verify_result(request: WorkerRequest, result: WorkerResult,
+                  sandbox=None) -> WorkerResult:
     """Independently check a worker result against the workspace.
 
     Never raises. Only ever upgrades information, never success:
@@ -383,6 +384,13 @@ def verify_result(request: WorkerRequest, result: WorkerResult) -> WorkerResult:
     - an explicit request.verify_command (argv, bounded, cwd=workspace)
       decides independently_verified_pass/fail;
     - otherwise the worker claim stands, explicitly unverified.
+
+    sandbox selects the verification execution boundary: None runs
+    the command directly (historic behavior); "bwrap" runs it inside
+    the same bubblewrap confinement as a sandboxed worker, so an
+    untrusted modified workspace cannot use verify_command to escape.
+    Anything else fails closed (unknown state, never an unsandboxed
+    run passed off as sandboxed).
     """
     try:
         if not isinstance(result, WorkerResult) or not result.ok:
@@ -403,40 +411,45 @@ def verify_result(request: WorkerRequest, result: WorkerResult) -> WorkerResult:
                     else [])
         if not cmd_list:
             return result
-        try:
-            proc = subprocess.Popen(
-                cmd_list, cwd=workspace,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, start_new_session=True)
-        except (FileNotFoundError, OSError) as e:
+        if sandbox is None:
+            argv, env, cleanup = cmd_list, None, None
+        elif sandbox == "bwrap":
+            home = _make_sandbox_home()
+            argv, env = _bwrap_wrap(cmd_list, workspace, home, None)
+            cleanup = lambda: shutil.rmtree(home, ignore_errors=True)
+        else:
             result.verification = "unknown"
-            result.error = f"Verification could not run: {e}"
+            result.error = (f"Verification misconfigured: unknown "
+                            f"sandbox '{sandbox}'.")
             return result
         try:
-            out_text, err_text = proc.communicate(timeout=request.timeout)
-            passed = proc.returncode == 0
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
             try:
-                proc.wait(timeout=10)
-            except Exception:
-                pass
-            result.verification = "unknown"
-            result.verify_exit = None
-            result.verify_output = ""
-            result.error = "Verification timed out."
-            return result
+                returncode, out_text, err_text = _run_bounded(
+                    argv, workspace, env, request.timeout)
+            except (FileNotFoundError, OSError) as e:
+                result.verification = "unknown"
+                result.error = f"Verification could not run: {e}"
+                return result
+            if returncode is None:
+                result.verification = "unknown"
+                result.verify_exit = None
+                result.verify_output = ""
+                result.error = "Verification timed out."
+                return result
+        finally:
+            if cleanup is not None:
+                cleanup()
         summary, _ = _verify_summary(out_text or "", err_text or "")
-        result.verify_exit = proc.returncode
+        result.verify_exit = returncode
         result.verify_output = summary
-        if passed:
+        if returncode == 0:
             result.verification = "independently_verified_pass"
         else:
             result.verification = "independently_verified_fail"
             clipped, _ = _clip(err_text or out_text or "")
             result.error = (
                 f"Verification command failed "
-                f"(exit {proc.returncode}): {clipped[:500]}")
+                f"(exit {returncode}): {clipped[:500]}")
         return result
     except Exception as e:
         try:
@@ -459,6 +472,133 @@ class WorkerProvider:
 
     def run(self, request: WorkerRequest) -> WorkerResult:
         raise NotImplementedError
+
+
+# ─── bubblewrap sandbox (explicit opt-in) ──────────────────────────
+#
+# Boundary: the worker sees ONLY the validated workspace (writable)
+# plus a throwaway HOME/XDG area and a private /tmp. The real home
+# directory (assistant config, SSH keys, browser profiles, sibling
+# repos), host /tmp, and host IPC (Wayland/X11, D-Bus, ssh-agent)
+# are never bound. System runtime (/usr, loader symlinks, /etc
+# read-only, /dev, /proc) stays available so stock CLIs execute.
+#
+# Deliberately NOT isolated: the network namespace is shared with the
+# host. Cloud coding CLIs (and a host Ollama at localhost) require
+# network during normal execution; pretending otherwise would
+# silently break them. There is no proxy/allowlist layer here.
+#
+# Identity: --uid/--gid map the sandbox to the invoking user (no root
+# inside; getuid() reports the real uid). This is filesystem/process
+# confinement, NOT protection against kernel exploits.
+
+SANDBOX_NONE = "none"
+SANDBOX_BWRAP = "bwrap"
+SANDBOX_MODES = (SANDBOX_NONE, SANDBOX_BWRAP)
+BWRAP_BIN = "bwrap"
+
+# Minimal child environment: everything else (DISPLAY, WAYLAND_*,
+# DBUS_*, SSH_AUTH_SOCK, XDG_RUNTIME_DIR, GEMINI_API_KEY, secrets)
+# is dropped. GOOGLE_API_KEY passes only because Goose puts it there
+# via its own _child_env (OpenCode inherits no credential at all).
+_SANDBOX_ENV_KEEP = frozenset({
+    "PATH", "LANG", "LC_ALL", "LC_MESSAGES", "LANGUAGE", "TERM",
+    "USER", "LOGNAME", "SHELL", "NO_COLOR",
+    "GOOSE_MODEL", "GOOSE_PROVIDER", "GOOSE_MODE",
+    "GOOGLE_API_KEY",
+})
+
+
+def _make_sandbox_home() -> str:
+    """Create a throwaway HOME with XDG subdirs. Caller removes it."""
+    import tempfile
+    home = tempfile.mkdtemp(prefix="cat-talker-sandbox-home-")
+    for sub in ("config", "cache", "share"):
+        os.makedirs(os.path.join(home, sub), exist_ok=True)
+    return home
+
+
+def _sandbox_env(base_env) -> dict:
+    """Minimal sandbox environment (names only, values from base).
+
+    base_env None means the current process environment. Anything not
+    in the allowlist is dropped — notably GEMINI_API_KEY, display
+    servers, D-Bus, ssh-agent, and the host XDG runtime dir.
+    """
+    base = os.environ if base_env is None else base_env
+    get = (base.get if hasattr(base, "get")
+           else lambda k, d=None: base[k] if k in base else d)
+    env = {}
+    for name in sorted(_SANDBOX_ENV_KEEP):
+        try:
+            value = get(name)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value:
+            env[name] = value
+    return env
+
+
+def _bwrap_wrap(inner_argv, workspace: str, home: str,
+                base_env) -> tuple:
+    """Wrap inner_argv (list, after --) for bubblewrap confinement.
+
+    Returns (argv, env). Pure construction (no execution) so tests
+    assert the exact boundary. Raises ValueError when bwrap is
+    missing (fail closed: the caller must not run unsandboxed).
+    """
+    bwrap = shutil.which(BWRAP_BIN)
+    if not bwrap:
+        raise ValueError(
+            "Coding error: sandbox 'bwrap' requested but the 'bwrap' "
+            "executable was not found on PATH.")
+    uid, gid = os.geteuid(), os.getegid()
+    argv = [
+        bwrap,
+        "--unshare-user", "--unshare-pid", "--unshare-ipc",
+        "--unshare-uts",
+        # Network namespace deliberately NOT unshared: cloud CLIs and
+        # host-local providers need real network (see module notes).
+        "--uid", str(uid), "--gid", str(gid),
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib", "/lib64",
+        "--ro-bind", "/etc", "/etc",
+        "--proc", "/proc", "--dev", "/dev",
+        "--tmpfs", "/tmp",
+        "--bind", workspace, workspace,
+        "--bind", home, home,
+    ]
+    # The worker binary itself must be visible: CLIs outside /usr
+    # (e.g. ~/.local/bin) get their containing directory bound
+    # read-only. Relative commands resolve inside the workspace.
+    binary = inner_argv[0] if inner_argv else ""
+    if os.path.isabs(binary):
+        bindir = os.path.dirname(binary)
+        if bindir and bindir != "/usr/bin":
+            argv += ["--ro-bind", bindir, bindir]
+    elif os.path.basename(binary) != binary:
+        pass  # relative path: resolved against cwd=workspace (bound)
+    else:
+        located = shutil.which(binary)
+        if located:
+            bindir = os.path.dirname(located)
+            if bindir != "/usr/bin":
+                argv += ["--ro-bind", bindir, bindir]
+        # else: spawn fails honestly inside the sandbox (exit 127).
+    argv += [
+        "--chdir", workspace,
+        "--die-with-parent",
+        "--",
+    ] + list(inner_argv)
+    env = _sandbox_env(base_env)
+    env["HOME"] = home
+    env["XDG_CONFIG_HOME"] = os.path.join(home, "config")
+    env["XDG_CACHE_HOME"] = os.path.join(home, "cache")
+    env["XDG_DATA_HOME"] = os.path.join(home, "share")
+    env["TMPDIR"] = "/tmp"
+    return argv, env
 
 
 class SubprocessWorkerProvider(WorkerProvider):
@@ -509,33 +649,19 @@ class SubprocessWorkerProvider(WorkerProvider):
         argv = self._build_argv(resolved, req)
         timeout = min(req.timeout, self.timeout)
         try:
-            proc = subprocess.Popen(
-                argv, cwd=req.workspace,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, start_new_session=True,
-                env=self._child_env(req))
+            returncode, out_text, err_text = _run_bounded(
+                argv, req.workspace, self._child_env(req), timeout)
         except FileNotFoundError as e:
             return WorkerResult(ok=False, error=f"Coding worker missing: {e}")
         except OSError as e:
             return WorkerResult(ok=False, error=f"Coding worker failed: {e}")
         except Exception as e:
             return WorkerResult(ok=False, error=f"Coding worker failed: {e}")
-        try:
-            out_text, err_text = proc.communicate(timeout=timeout)
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
-            try:
-                proc.wait(timeout=10)
-            except Exception:
-                pass
+        if returncode is None:
             return WorkerResult(
                 ok=False,
                 error=f"Coding worker timed out after {timeout}s; stopped.",
                 workspace=req.workspace)
-        except Exception as e:
-            _kill_process_group(proc)
-            return WorkerResult(ok=False, error=f"Coding worker failed: {e}")
         out, out_cut = _clip(out_text or "")
         err, err_cut = _clip(err_text or "")
         return result_from_process(returncode, out, err,
@@ -621,6 +747,130 @@ def _kill_process_group(proc):
             pass
 
 
+def _run_bounded(argv, cwd, env, timeout):
+    """Spawn argv (list, never shell) bounded by timeout seconds.
+
+    Shared by worker execution and independent verification so both
+    get identical timeout/process-group semantics. Returns
+    (returncode, stdout, stderr); returncode None means the timeout
+    fired (the whole process group is already killed). Popen-time
+    errors propagate for the caller to report honestly.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True, env=env)
+    try:
+        out_text, err_text = proc.communicate(timeout=timeout)
+        return proc.returncode, out_text, err_text
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        return None, "", ""
+
+
+class BubblewrapWorkerProvider(WorkerProvider):
+    """Confine any SubprocessWorkerProvider backend in bubblewrap.
+
+    Decorator: validation, argv, credentials, timeout, output bounds,
+    result parsing, and verification stay exactly the inner
+    provider's — only the execution boundary changes (bwrap prefix,
+    throwaway HOME, minimal env). Works for OpenCode, Goose, and
+    Goose-Lite without duplicating their behavior. Exposes
+    verify_sandbox so delegate() routes independent verification
+    through the same boundary.
+    """
+
+    name = "bwrap-sandbox"
+    verify_sandbox = "bwrap"
+
+    def __init__(self, inner: WorkerProvider):
+        if not isinstance(inner, SubprocessWorkerProvider):
+            raise ValueError(
+                "Coding error: bubblewrap sandbox wraps a "
+                "SubprocessWorkerProvider backend only.")
+        self.inner = inner
+
+    def run(self, request: WorkerRequest) -> WorkerResult:
+        req = request.validated()
+        inner = self.inner
+        resolved = shutil.which(inner.binary)
+        if not resolved:
+            return WorkerResult(
+                ok=False,
+                error=f"Coding worker not installed: '{inner.binary}' "
+                      f"not found on PATH.",
+                workspace=req.workspace)
+        try:
+            inner_argv = inner._build_argv(resolved, req)
+            inner_env = inner._child_env(req)
+        except (ValueError, PermissionError) as e:
+            return WorkerResult(ok=False, error=str(e),
+                                workspace=req.workspace)
+        home = _make_sandbox_home()
+        try:
+            try:
+                argv, env = _bwrap_wrap(inner_argv, req.workspace, home,
+                                        inner_env)
+            except ValueError as e:
+                return WorkerResult(ok=False, error=str(e),
+                                    workspace=req.workspace)
+            timeout = min(req.timeout, inner.timeout)
+            try:
+                returncode, out_text, err_text = _run_bounded(
+                    argv, req.workspace, env, timeout)
+            except (FileNotFoundError, OSError) as e:
+                return WorkerResult(
+                    ok=False,
+                    error=f"Coding worker sandbox failed: {e}",
+                    workspace=req.workspace)
+            except Exception as e:
+                return WorkerResult(
+                    ok=False,
+                    error=f"Coding worker sandbox failed: {e}",
+                    workspace=req.workspace)
+            if returncode is None:
+                return WorkerResult(
+                    ok=False,
+                    error=f"Coding worker timed out after {timeout}s; "
+                          f"stopped.",
+                    workspace=req.workspace)
+            out, out_cut = _clip(out_text or "")
+            err, err_cut = _clip(err_text or "")
+            return result_from_process(returncode, out, err,
+                                       out_cut or err_cut, req.workspace)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+
+def select_sandbox(name: str | None = None) -> str:
+    """Sandbox mode: 'none' default, 'bwrap' explicit opt-in. Raises
+    ValueError on anything else (fail closed, never silent)."""
+    cleaned = (name if isinstance(name, str) and name.strip()
+               else os.environ.get("CAT_TALKER_CODER_SANDBOX", "")
+               ).strip().lower()
+    if not cleaned:
+        cleaned = SANDBOX_NONE
+    if cleaned not in SANDBOX_MODES:
+        raise ValueError(
+            f"Coding error: unknown coder sandbox '{cleaned}'. "
+            f"Allowed: {', '.join(SANDBOX_MODES)}.")
+    return cleaned
+
+
+def maybe_sandbox(provider: WorkerProvider,
+                  mode: str | None = None) -> WorkerProvider:
+    """Wrap a subprocess backend in bubblewrap when requested."""
+    if select_sandbox(mode) == SANDBOX_BWRAP:
+        if isinstance(provider, BubblewrapWorkerProvider):
+            return provider
+        return BubblewrapWorkerProvider(provider)
+    return provider
+
+
 _DEFAULT_PROVIDER = SubprocessWorkerProvider()
 
 
@@ -653,8 +903,8 @@ def delegate(request: WorkerRequest | dict,
     try:
         req = request.validated() if isinstance(
             request, WorkerRequest) else build_request(**request)
-        engine = (provider if provider is not None
-                  else select_backend())
+        engine = maybe_sandbox(
+            provider if provider is not None else select_backend())
         try:
             result = engine.run(req)
         except NotImplementedError as e:
@@ -663,7 +913,8 @@ def delegate(request: WorkerRequest | dict,
             return f"Coding task FAILED.\nError: {e}"
         if not isinstance(result, WorkerResult):
             return "Coding task FAILED.\nError: worker returned no result."
-        return verify_result(req, result).render()
+        sandbox = getattr(engine, "verify_sandbox", None)
+        return verify_result(req, result, sandbox=sandbox).render()
     except (ValueError, PermissionError) as e:
         return str(e)
     except Exception as e:
