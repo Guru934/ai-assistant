@@ -328,8 +328,50 @@ def test_guidance_restricts_worker_to_coding():
     assert "run_coding_task" in text
     for topic in ("weather", "web/news", "media", "conversation"):
         assert topic in text
-    assert "source of truth" in text
     assert "never claim" in text.lower()
+    # The worker result must never be framed as the source of truth:
+    # worker claims stay claims until independently verified.
+    assert "source of truth" not in text
+    assert "never present worker-reported" in text.lower()
+
+
+def test_run_coding_task_docstring_separates_claims():
+    from cat_talker.tools import run_coding_task
+    doc = run_coding_task.__doc__ or ""
+    assert "source of truth" not in doc
+    assert "never present worker-reported" in doc.lower()
+
+
+def test_unverified_render_marks_worker_prose_unverified():
+    # Exact reported failure: worker says "all N tests passed",
+    # verification == unknown. Our rendered result must attribute
+    # the claim every time and never assert it as verified fact.
+    record = cw.WorkerResult(
+        ok=True,
+        summary="Ran 6 tests, all 6 tests passed.",
+        files_changed=["a.py"],
+        tests_passed=True,
+        verification="unknown",
+        workspace="/tmp/ws")
+    rendered = record.render()
+    assert "verification was not available" in rendered
+    assert "UNVERIFIED" in rendered
+    assert "NOT independently verified" in rendered
+    assert "Tests: independently verified." not in rendered
+    assert "independently_verified_pass" not in rendered
+    # Attribution must wrap the worker's own success prose.
+    marker = rendered.index("UNVERIFIED")
+    assert "all 6 tests passed" in rendered[marker:]
+
+
+def test_not_run_render_says_not_run():
+    record = cw.WorkerResult(
+        ok=True, summary="did stuff", verification="not_run",
+        workspace="/tmp/ws")
+    rendered = record.render()
+    assert "verification was not run" in rendered.lower() \
+        or "verification was not available" in rendered
+    assert "Tests: independently verified." not in rendered
 
 
 def test_provider_boundary_is_replaceable(tmp_path):

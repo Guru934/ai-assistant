@@ -226,7 +226,8 @@ class WorkerResult:
             if self.verification == "independently_verified_pass":
                 lines.append(f"Summary: {self.summary}")
             else:
-                lines.append(f"Worker reports: {self.summary}")
+                lines.append("Worker reports (UNVERIFIED - do not present "
+                             f"as verified fact): {self.summary}")
         lines.extend(_files_block(self.files_changed))
         if self.commands:
             shown = "; ".join(str(c) for c in self.commands[:5])

@@ -328,9 +328,11 @@ def run_coding_task(task: str, workspace: str = "") -> str:
     repair failures...', 'refactor...'). Never route desktop commands,
     weather, web/news questions, media controls, or conversation here.
     Name the repository explicitly in workspace; an empty workspace is
-    an honest ask-back, never a guessed default. The worker result is
-    the source of truth - never claim completion the worker did not
-    report. Never raises: failures return honest error strings.
+    an honest ask-back, never a guessed default. Worker claims stay
+    claims: report results only as worker-reported unless independent
+    verification passed - never claim completion the worker did not
+    report, and never present worker-reported tests as verified fact.
+    Never raises: failures return honest error strings.
     """
     def _execute(task, workspace):
         try:
