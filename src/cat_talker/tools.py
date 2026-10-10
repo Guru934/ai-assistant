@@ -320,35 +320,8 @@ def read_aloud(text: str) -> str:
 # reuses the same spoken-approval flow as click/type/press: the first
 # call pauses for an out-loud "yes", confirm_action runs it.
 
-def run_coding_task(task: str, workspace: str = "",
-                    verify_command=None) -> str:
-    """Delegate explicit coding work to the external coding worker.
-
-    Use ONLY for clearly coding-oriented requests ('create a Python
-    file...', 'fix this bug...', 'implement...', 'run the tests and
-    repair failures...', 'refactor...'). Never route desktop commands,
-    weather, web/news questions, media controls, or conversation here.
-    Name the repository explicitly in workspace; an empty workspace is
-    an honest ask-back, never a guessed default. Worker claims stay
-    claims: report results only as worker-reported unless independent
-    verification passed - never claim completion the worker did not
-    report, and never present worker-reported tests as verified fact.
-    Independent verification runs ONLY the exact verify_command given
-    here (argv list, e.g. ["python3", "test_calc.py"]) - never invent,
-    infer, guess, or substitute one. If the user asks for independent
-    verification but has not named the exact command, do NOT call this
-    tool yet: ask which exact command to run. Without verify_command,
-    verification stays unknown and worker-run tests are never promoted
-    to independent verification. Never raises: failures return honest
-    error strings.
-
-    Args:
-        task: Coding task description (required, non-empty).
-        workspace: Explicit repository path (required).
-        verify_command: Optional exact verification argv (list of
-            non-empty strings, no shell). Only ever what was
-            explicitly requested, never inferred.
-    """
+def _delegate_coding(task: str, workspace: str,
+                     verify_command=None) -> str:
     def _execute(task, workspace, verify_command=None):
         try:
             from cat_talker.coding_worker import build_request, delegate
@@ -371,6 +344,58 @@ def run_coding_task(task: str, workspace: str = "",
                          {"task": task, "workspace": workspace,
                           "verify_command": verify_command},
                          "delegate this coding task to the coding worker")
+
+
+def run_coding_task(task: str, workspace: str = "") -> str:
+    """Delegate explicit coding work to the external coding worker.
+
+    Use ONLY for clearly coding-oriented requests ('create a Python
+    file...', 'fix this bug...', 'implement...', 'run the tests and
+    repair failures...', 'refactor...'). Never route desktop commands,
+    weather, web/news questions, media controls, or conversation here.
+    Name the repository explicitly in workspace; an empty workspace is
+    an honest ask-back, never a guessed default. Worker claims stay
+    claims: report results only as worker-reported unless independent
+    verification passed - never claim completion the worker did not
+    report, and never present worker-reported tests as verified fact.
+    This ordinary tool is NOT for requests requiring caller-specified
+    independent verification: when the user names an exact verification
+    command, use run_coding_task_with_verification instead - never fold
+    the command into the task prose here. Verification stays unknown
+    and worker-run tests are never promoted to independent
+    verification. Never raises: failures return honest error strings.
+
+    Args:
+        task: Coding task description (required, non-empty).
+        workspace: Explicit repository path (required).
+    """
+    return _delegate_coding(task, workspace)
+
+
+def run_coding_task_with_verification(task: str,
+                                      verify_command: list[str],
+                                      workspace: str = "") -> str:
+    """Delegate coding work plus caller-specified independent verification.
+
+    Use ONLY when the user names an exact verification command for a
+    clearly coding-oriented request. The required verify_command MUST
+    come from the user's explicit request - never invent, infer, guess,
+    or substitute one. If the user asks for independent verification
+    but has not named the exact command, do NOT call this tool yet: ask
+    which exact command to run. Same approval, sandbox, backend, and
+    truthful-reporting guarantees as run_coding_task. Never raises:
+    failures return honest error strings.
+
+    Args:
+        task: Coding task description (required, non-empty).
+        verify_command: Required exact verification argv (list of
+            non-empty strings, no shell), e.g. ["python3",
+            "test_calc.py"]. Only ever what the user explicitly
+            requested, never inferred.
+        workspace: Explicit repository path (required).
+    """
+    return _delegate_coding(task, workspace,
+                            verify_command=verify_command)
 
 
 def list_directory(path: str) -> str:
@@ -1097,7 +1122,7 @@ ALL_TOOLS = [
     inspect_screen, save_user_preference, get_current_datetime,
     web_search, fetch_webpage, get_weather,
     get_preference, set_preference, delete_preference,
-    read_aloud, run_coding_task,
+    read_aloud, run_coding_task, run_coding_task_with_verification,
     create_reminder, list_reminders, cancel_reminder
 ]
 

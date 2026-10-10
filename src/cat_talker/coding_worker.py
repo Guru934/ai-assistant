@@ -187,6 +187,11 @@ class WorkerResult:
     # command ran) and bounded output, kept separate from worker output.
     verify_exit: object = None  # int / None (no command ran)
     verify_output: str = ""
+    # Resolved runtime facts, set by delegate() from the actual
+    # execution path (never from configuration alone). Rendered so
+    # Chibi can report them; empty when unset (older constructions).
+    backend: str = ""
+    sandbox: str = ""
 
     def render(self) -> str:
         """Stable compact report: claim, verified fact, and unknown stay
@@ -204,6 +209,7 @@ class WorkerResult:
             lines.append("Coding task FAILED.")
             if workspace_line:
                 lines.append(workspace_line)
+            lines.extend(_runtime_block(self.backend, self.sandbox))
             if self.error:
                 lines.append(f"Reason: {self.error}")
             elif self.summary:
@@ -222,6 +228,7 @@ class WorkerResult:
         if workspace_line:
             lines.append(workspace_line)
         lines.append(f"Verification: {self.verification}")
+        lines.extend(_runtime_block(self.backend, self.sandbox))
         if self.summary:
             if self.verification == "independently_verified_pass":
                 lines.append(f"Summary: {self.summary}")
@@ -292,6 +299,20 @@ def _verify_block(verify_exit, verify_output: str) -> str:
         head = "Verification output:"
     body = verify_output if isinstance(verify_output, str) else ""
     return head + (("\n" + body) if body else " (none)")
+
+
+def _runtime_block(backend: str, sandbox: str) -> list:
+    """Resolved-runtime lines for render() (empty when unset).
+
+    Only ever the backend/boundary delegate() confirmed from the
+    actual execution path - never configuration claims.
+    """
+    lines = []
+    if isinstance(backend, str) and backend:
+        lines.append(f"Backend: {backend}")
+    if isinstance(sandbox, str) and sandbox:
+        lines.append(f"Sandbox: {sandbox}")
+    return lines
 
 
 def _claim_state(tests) -> str:
@@ -404,6 +425,11 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
                 result.error = (
                     f"Verification failed: reported file '{entry}' "
                     f"does not exist in the workspace.")
+                logger.warning(
+                    "coding verification: sandbox=%s workspace=%s "
+                    "outcome=independently_verified_fail "
+                    "reason=missing-reported-file",
+                    _sandbox_label(sandbox), workspace)
                 return result
         command = request.validated().verify_command
         if not command:
@@ -412,6 +438,7 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
                     else [])
         if not cmd_list:
             return result
+        vsandbox = _sandbox_label(sandbox)
         if sandbox is None:
             argv, env, cleanup = cmd_list, None, None
         elif sandbox == "bwrap":
@@ -419,13 +446,27 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
             # No binary-dir binding here: verification commands must
             # already live in /usr or the workspace, otherwise they
             # fail honestly instead of punching holes (see _bwrap_wrap).
-            argv, env = _bwrap_wrap(cmd_list, workspace, home, None,
-                                    bind_binary_dir=False)
+            try:
+                argv, env = _bwrap_wrap(cmd_list, workspace, home, None,
+                                        bind_binary_dir=False)
+            except ValueError as e:
+                shutil.rmtree(home, ignore_errors=True)
+                result.verification = "unknown"
+                result.error = f"Verification could not run: {e}"
+                logger.error(
+                    "coding verification sandbox setup failed: "
+                    "sandbox=bwrap workspace=%s error=%s "
+                    "(not executed; never reported as sandboxed)",
+                    workspace, e)
+                return result
             cleanup = lambda: shutil.rmtree(home, ignore_errors=True)
         else:
             result.verification = "unknown"
             result.error = (f"Verification misconfigured: unknown "
                             f"sandbox '{sandbox}'.")
+            logger.warning(
+                "coding verification misconfigured: sandbox=%s "
+                "workspace=%s (not executed)", sandbox, workspace)
             return result
         try:
             try:
@@ -434,12 +475,18 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
             except (FileNotFoundError, OSError) as e:
                 result.verification = "unknown"
                 result.error = f"Verification could not run: {e}"
+                logger.warning(
+                    "coding verification launch failed: sandbox=%s "
+                    "workspace=%s error=%s", vsandbox, workspace, e)
                 return result
             if returncode is None:
                 result.verification = "unknown"
                 result.verify_exit = None
                 result.verify_output = ""
                 result.error = "Verification timed out."
+                logger.warning(
+                    "coding verification timed out: sandbox=%s "
+                    "workspace=%s", vsandbox, workspace)
                 return result
         finally:
             if cleanup is not None:
@@ -455,6 +502,10 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
             result.error = (
                 f"Verification command failed "
                 f"(exit {returncode}): {clipped[:500]}")
+        logger.info(
+            "coding verification: sandbox=%s workspace=%s outcome=%s "
+            "exit=%s", vsandbox, workspace, result.verification,
+            returncode)
         return result
     except Exception as e:
         try:
@@ -661,6 +712,9 @@ class SubprocessWorkerProvider(WorkerProvider):
                 workspace=req.workspace)
         argv = self._build_argv(resolved, req)
         timeout = min(req.timeout, self.timeout)
+        logger.info("coding worker launch: backend=%s sandbox=none "
+                    "workspace=%s (direct unsandboxed invocation)",
+                    _backend_label(self), req.workspace)
         try:
             returncode, out_text, err_text = _run_bounded(
                 argv, req.workspace, self._child_env(req), timeout)
@@ -829,8 +883,16 @@ class BubblewrapWorkerProvider(WorkerProvider):
                 argv, env = _bwrap_wrap(inner_argv, req.workspace, home,
                                         inner_env)
             except ValueError as e:
+                logger.error(
+                    "coding worker sandbox setup failed: backend=%s "
+                    "workspace=%s error=%s "
+                    "(not executed; never reported as sandboxed)",
+                    _backend_label(self), req.workspace, e)
                 return WorkerResult(ok=False, error=str(e),
                                     workspace=req.workspace)
+            logger.info("coding worker launch: backend=%s sandbox=bwrap "
+                        "workspace=%s (bubblewrap invocation constructed)",
+                        _backend_label(self), req.workspace)
             timeout = min(req.timeout, inner.timeout)
             try:
                 returncode, out_text, err_text = _run_bounded(
@@ -873,6 +935,55 @@ def select_sandbox(name: str | None = None) -> str:
             f"Coding error: unknown coder sandbox '{cleaned}'. "
             f"Allowed: {', '.join(SANDBOX_MODES)}.")
     return cleaned
+
+
+def _sandbox_label(sandbox) -> str:
+    """Effective verification boundary from the resolved sandbox arg."""
+    if sandbox is None:
+        return SANDBOX_NONE
+    if sandbox == SANDBOX_BWRAP:
+        return SANDBOX_BWRAP
+    return "unknown"
+
+
+def _backend_label(provider: WorkerProvider) -> str:
+    """Honest backend label from the resolved provider (never config).
+
+    Unwraps the bubblewrap decorator to the real backend. Goose
+    variants are distinguished by their resolved model; a non-default
+    worker binary is labeled custom (binary basename only, no args).
+    Anything else falls back to the provider class name.
+    """
+    inner = (provider.inner
+             if isinstance(provider, BubblewrapWorkerProvider)
+             and isinstance(provider.inner, SubprocessWorkerProvider)
+             else provider)
+    if isinstance(inner, GooseWorkerProvider):
+        model = getattr(inner, "goose_model", "") or ""
+        tag = (BACKEND_GOOSE_LITE
+               if model == GOOSE_FLASH_LITE_MODEL else BACKEND_GOOSE)
+        return f"{tag}:{model}" if model else tag
+    if isinstance(inner, SubprocessWorkerProvider):
+        binary = getattr(inner, "binary", "") or ""
+        if binary == DEFAULT_CLI_BIN:
+            return BACKEND_OPENCODE
+        return f"custom-cli:{os.path.basename(binary)}"
+    name = type(provider).__name__ or "unknown"
+    return name
+
+
+def _execution_boundary(engine: WorkerProvider) -> str:
+    """Effective coding boundary from the resolved engine (never env).
+
+    Only a successfully constructed BubblewrapWorkerProvider reports
+    'bwrap'; a direct subprocess engine reports 'none'; anything else
+    is honestly 'unknown'.
+    """
+    if isinstance(engine, BubblewrapWorkerProvider):
+        return SANDBOX_BWRAP
+    if isinstance(engine, SubprocessWorkerProvider):
+        return SANDBOX_NONE
+    return "unknown"
 
 
 def maybe_sandbox(provider: WorkerProvider,
@@ -921,14 +1032,34 @@ def delegate(request: WorkerRequest | dict,
             request, WorkerRequest) else build_request(**request)
         engine = maybe_sandbox(
             provider if provider is not None else select_backend())
+        backend = _backend_label(engine)
+        boundary = _execution_boundary(engine)
+        verify_requested = bool(req.verify_command)
+        logger.info("coding task start: backend=%s sandbox=%s "
+                    "workspace=%s verify_requested=%s",
+                    backend, boundary, req.workspace, verify_requested)
         try:
             result = engine.run(req)
         except NotImplementedError as e:
+            logger.warning("coding task launch failed: backend=%s "
+                           "sandbox=%s workspace=%s error=%s",
+                           backend, boundary, req.workspace, e)
             return f"Coding error: {e}"
         except Exception as e:
+            logger.warning("coding task launch failed: backend=%s "
+                           "sandbox=%s workspace=%s error=%s",
+                           backend, boundary, req.workspace, e)
             return f"Coding task FAILED.\nError: {e}"
         if not isinstance(result, WorkerResult):
+            logger.warning("coding task produced no result: backend=%s "
+                           "sandbox=%s workspace=%s",
+                           backend, boundary, req.workspace)
             return "Coding task FAILED.\nError: worker returned no result."
+        if not result.ok:
+            logger.warning("coding task failed: backend=%s sandbox=%s "
+                           "workspace=%s", backend, boundary, req.workspace)
+        result.backend = backend
+        result.sandbox = boundary
         sandbox = getattr(engine, "verify_sandbox", None)
         return verify_result(req, result, sandbox=sandbox).render()
     except (ValueError, PermissionError) as e:

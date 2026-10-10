@@ -1435,13 +1435,21 @@ def test_worker_argv_still_binds_own_binary_dir(tmp_path, monkeypatch):
 
 def test_tool_schema_exposes_verify_command():
     import inspect
-    from cat_talker.tools import run_coding_task
-    params = inspect.signature(run_coding_task).parameters
+    from cat_talker.tools import (run_coding_task,
+                                  run_coding_task_with_verification)
+    # Ordinary tool: no verification slot; verification tool owns it.
+    ordinary = inspect.signature(run_coding_task).parameters
+    assert "verify_command" not in ordinary
+    params = inspect.signature(
+        run_coding_task_with_verification).parameters
     assert "verify_command" in params
-    assert params["verify_command"].default is None
-    doc = run_coding_task.__doc__ or ""
+    assert params["verify_command"].default is inspect.Parameter.empty
+    assert params["verify_command"].annotation == list[str]
+    doc = run_coding_task_with_verification.__doc__ or ""
     assert "verify_command" in doc
     assert "never invent" in doc.lower()
+    plain_doc = run_coding_task.__doc__ or ""
+    assert "run_coding_task_with_verification" in plain_doc
 
 
 def test_explicit_verify_command_reaches_request(tmp_path, monkeypatch):
@@ -1462,6 +1470,54 @@ def test_explicit_verify_command_reaches_request(tmp_path, monkeypatch):
     assert req.verify_command == ("python3", "test_calc.py")
     out = cw.delegate(req)
     assert isinstance(out, str)
+
+
+def test_verification_tool_passes_exact_command_unchanged(tmp_path,
+                                                          monkeypatch):
+    import cat_talker.tools as tools_mod
+    from cat_talker.tools import (confirm_action,
+                                  run_coding_task_with_verification)
+    seen = {}
+    real_build = cw.build_request
+
+    def _spy(workspace, task, **kwargs):
+        seen["verify_command"] = kwargs.get("verify_command")
+        return real_build(workspace, task, **kwargs)
+
+    monkeypatch.setattr(cw, "build_request", _spy)
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(cw.subprocess, "Popen",
+                        lambda *a, **k: _FakePopen(out="done"))
+    saved = tools_mod.PENDING_RISKY_ACTION
+    tools_mod.PENDING_RISKY_ACTION = None
+    try:
+        paused = run_coding_task_with_verification(
+            "fix bug", ["python3", "test_calc.py"], str(tmp_path))
+        assert "PAUSED FOR SAFETY" in paused
+        out = confirm_action()
+        assert isinstance(out, str)
+        assert seen["verify_command"] == ["python3", "test_calc.py"]
+    finally:
+        tools_mod.PENDING_RISKY_ACTION = saved
+
+
+def test_verification_tool_rejects_empty_and_blank(tmp_path, monkeypatch):
+    import cat_talker.tools as tools_mod
+    from cat_talker.tools import (confirm_action,
+                                  run_coding_task_with_verification)
+    saved = tools_mod.PENDING_RISKY_ACTION
+    try:
+        for bad in ([], ["python3", "  "], "pytest -q"):
+            tools_mod.PENDING_RISKY_ACTION = None
+            paused = run_coding_task_with_verification(
+                "fix bug", bad, str(tmp_path))  # type: ignore[arg-type]
+            assert "PAUSED FOR SAFETY" in paused
+            out = confirm_action()
+            assert "FAILED" in out
+            assert "verify_command" in out
+    finally:
+        tools_mod.PENDING_RISKY_ACTION = saved
 
 
 def test_verify_command_accepted_form(tmp_path):
@@ -1545,3 +1601,205 @@ def test_sandboxed_verify_uses_bwrap_boundary_with_command(tmp_path,
     assert seen["argv"][0] == real_which("bwrap")
     assert "--" in seen["argv"]
     assert seen["argv"][-1] == "true"
+
+
+# ─── Live SDK schema compatibility (regression) ─────────────────────
+# The untyped verify_command=None default once broke Gemini Live
+# session startup (Pydantic IsInstanceSchema over inspect._empty).
+# These tests run the installed SDK's own declaration parser over
+# the real model-facing functions.
+
+def test_live_schema_generation_for_run_coding_task():
+    afc = pytest.importorskip(
+        "google.genai._automatic_function_calling_util")
+    from cat_talker.tools import (run_coding_task,
+                                  run_coding_task_with_verification)
+    plain = afc.parse_function_declaration_json_schema(
+        run_coding_task, None)
+    plain_props = (plain.parameters_json_schema or {}).get(
+        "properties", {})
+    assert "verify_command" not in plain_props
+    decl = afc.parse_function_declaration_json_schema(
+        run_coding_task_with_verification, None)
+    schema = decl.parameters_json_schema or {}
+    props = schema.get("properties", {})
+    assert "verify_command" in props
+    text = json.dumps(props["verify_command"])
+    assert '"array"' in text and '"string"' in text
+    assert "null" not in text
+    required = schema.get("required") or []
+    assert "task" in required
+    assert "verify_command" in required
+
+
+def test_live_schema_generation_for_all_tools():
+    afc = pytest.importorskip(
+        "google.genai._automatic_function_calling_util")
+    from cat_talker.tools import ALL_TOOLS
+    for func in ALL_TOOLS:
+        afc.parse_function_declaration_json_schema(func, None)
+
+
+def test_verify_command_trigger_wording_in_model_facing_description():
+    afc = pytest.importorskip(
+        "google.genai._automatic_function_calling_util")
+    from cat_talker.tools import (run_coding_task,
+                                  run_coding_task_with_verification)
+    decl = afc.parse_function_declaration_json_schema(
+        run_coding_task_with_verification, None)
+    # The model-facing artifact is the declaration description, built
+    # from the real docstring: the required slot must carry the
+    # explicit-request rule with a concrete example.
+    text = " ".join((decl.description or "").split())
+    assert "MUST come from the user's explicit request" in text
+    assert '["python3", "test_calc.py"]' in text
+    assert "ask which exact command to run" in text
+    # Schema shape: required string array, not nullable.
+    schema = decl.parameters_json_schema or {}
+    props = schema.get("properties", {})
+    assert "verify_command" in props
+    assert "verify_command" in (schema.get("required") or [])
+    # Ordinary tool points away from verification requests.
+    plain = afc.parse_function_declaration_json_schema(
+        run_coding_task, None)
+    plain_text = " ".join((plain.description or "").split())
+    assert "run_coding_task_with_verification" in plain_text
+
+
+def test_guidance_reinforces_verify_command_placement():
+    text = build_system_instructions()
+    assert "never fold it into the task prose" in text
+    assert "run_coding_task_with_verification" in text
+    assert "ask which exact command to run" in text
+
+
+# ─── Runtime backend/sandbox audit logging ──────────────────────────
+# Logs (never config) prove which backend and boundary really ran.
+
+def _start_records(caplog):
+    return [r for r in caplog.records
+            if "coding task start" in r.getMessage()]
+
+
+def test_audit_default_backend_is_opencode(monkeypatch):
+    from cat_talker.coding_worker import (maybe_sandbox, select_backend,
+                                          _backend_label,
+                                          _execution_boundary)
+    monkeypatch.delenv("CAT_TALKER_CODER_BACKEND", raising=False)
+    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+    engine = maybe_sandbox(select_backend())
+    assert _backend_label(engine) == "opencode"
+    assert _execution_boundary(engine) == "bwrap"
+
+
+def test_audit_explicit_goose_stays_opt_in():
+    from cat_talker.coding_worker import (select_backend, _backend_label)
+    assert _backend_label(select_backend("goose")).startswith("goose:")
+    lite = _backend_label(select_backend("goose-lite"))
+    assert lite.startswith("goose-lite:")
+
+
+def test_audit_bwrap_launch_logged_for_verified_run(tmp_path, monkeypatch,
+                                                   caplog):
+    import logging
+    from cat_talker.coding_worker import (SubprocessWorkerProvider,
+                                          delegate)
+    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        out = delegate({"workspace": str(tmp_path), "task": "noop",
+                        "verify_command": ["true"]},
+                       provider=SubprocessWorkerProvider(binary="true"))
+    assert "Backend: custom-cli:true" in out
+    assert "Sandbox: bwrap" in out
+    assert "Verification: independently_verified_pass" in out
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("coding task start" in m and "backend=custom-cli:true" in m
+               and "sandbox=bwrap" in m and "verify_requested=True" in m
+               for m in messages)
+    assert any("coding worker launch" in m and "sandbox=bwrap" in m
+               for m in messages)
+    assert any("coding verification" in m and "sandbox=bwrap" in m
+               and "outcome=independently_verified_pass" in m
+               and "exit=0" in m for m in messages)
+
+
+def test_audit_explicit_none_reports_unsandboxed(tmp_path, monkeypatch,
+                                                caplog):
+    import logging
+    from cat_talker.coding_worker import (SubprocessWorkerProvider,
+                                          delegate)
+    monkeypatch.setenv("CAT_TALKER_CODER_SANDBOX", "none")
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        out = delegate({"workspace": str(tmp_path), "task": "noop"},
+                       provider=SubprocessWorkerProvider(binary="true"))
+    assert "Sandbox: none" in out
+    assert "Verification: unknown" in out
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("sandbox=none" in m and "direct unsandboxed" in m
+               for m in messages)
+    assert not any("sandbox=bwrap" in m for m in messages)
+
+
+def test_audit_verifier_boundary_independent_of_worker(tmp_path,
+                                                      monkeypatch, caplog):
+    import logging
+    import cat_talker.coding_worker as cwmod
+    req = build_request(str(tmp_path), "noop")
+    record = cwmod.WorkerResult(ok=True, summary="done")
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        verified = cwmod.verify_result(req, record, sandbox="bwrap")
+    assert verified.verification == "not_run"  # no command configured
+    req2 = build_request(str(tmp_path), "noop",
+                         verify_command=["true"])
+    record2 = cwmod.WorkerResult(ok=True, summary="done")
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        verified2 = cwmod.verify_result(req2, record2, sandbox=None)
+    assert verified2.verification == "independently_verified_pass"
+    worker_msgs = [r.getMessage() for r in caplog.records
+                   if "coding verification" in r.getMessage()]
+    assert any("sandbox=none" in m and "exit=0" in m
+               for m in worker_msgs)
+
+
+def test_audit_failed_verification_logs_nonzero_exit(tmp_path, caplog):
+    import logging
+    import cat_talker.coding_worker as cwmod
+    req = build_request(str(tmp_path), "noop",
+                        verify_command=["false"])
+    record = cwmod.WorkerResult(ok=True, summary="worker claims pass",
+                                tests_passed=True)
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        verified = cwmod.verify_result(req, record, sandbox=None)
+    assert verified.verification == "independently_verified_fail"
+    assert "independently verified." not in verified.render()
+    assert any("outcome=independently_verified_fail" in r.getMessage()
+               and "exit=1" in r.getMessage() for r in caplog.records)
+
+
+def test_audit_failed_sandbox_setup_never_reports_sandboxed(
+        tmp_path, monkeypatch, caplog):
+    import logging
+    import cat_talker.coding_worker as cwmod
+    inner = cwmod.SubprocessWorkerProvider(binary="true")
+    engine = cwmod.BubblewrapWorkerProvider(inner)
+
+    def _boom(argv, workspace, home, base_env, bind_binary_dir=True):
+        raise ValueError("Coding error: sandbox 'bwrap' requested but "
+                         "the 'bwrap' executable was not found on PATH.")
+
+    monkeypatch.setattr(cwmod, "_bwrap_wrap", _boom)
+    req = build_request(str(tmp_path), "noop")
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        result = engine.run(req)
+    assert result.ok is False
+    assert "bwrap" in result.error
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("sandbox setup failed" in m for m in messages)
+    assert not any("sandbox=bwrap workspace" in m
+                   and "launch" in m for m in messages)

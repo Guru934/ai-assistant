@@ -34,7 +34,7 @@ SIDE_EFFECT_TOOLS = frozenset({
     "confirm_action", "cancel_action",
     "click_screen", "type_text", "press_key",
     "save_user_preference", "set_preference", "delete_preference",
-    "read_aloud", "run_coding_task",
+    "read_aloud", "run_coding_task", "run_coding_task_with_verification",
     "create_reminder", "cancel_reminder",
 })
 
@@ -348,7 +348,9 @@ def build_system_instructions():
         "text read aloud (long articles, forecasts, tool output). "
         "CODING WORKER: for clearly coding-oriented requests ('create a Python "
         "file...', 'fix this bug...', 'implement...', 'run the tests and repair "
-        "failures...', 'refactor...') you may delegate with run_coding_task, "
+        "failures...', 'refactor...') you may delegate with run_coding_task "
+        "(or run_coding_task_with_verification when the user names an "
+        "exact verification command), "
         "naming the repository explicitly - never desktop commands, weather, "
         "web/news, media, or conversation. Coding writes need spoken approval "
         "like other risky actions. Worker claims and verified facts "
@@ -357,10 +359,16 @@ def build_system_instructions():
         "passed; never claim completion the worker did not report, and "
         "never present worker-reported test results as verified fact. "
         "Independent verification runs ONLY an exact verify_command "
-        "given to run_coding_task - never invent, infer, guess, or "
-        "substitute one. If the user asks for independent verification "
-        "but has not named the exact command, do NOT call "
-        "run_coding_task yet: ask which exact command to run. "
+        "given to run_coding_task_with_verification - never invent, "
+        "infer, guess, or substitute one. When the user names an exact "
+        "verification command, use run_coding_task_with_verification "
+        "and pass the exact command as argv; when the user does not "
+        "request independent verification, use the ordinary "
+        "run_coding_task. If the user asks for independent verification "
+        "but has not named the exact command, do NOT call either "
+        "coding tool yet: ask which exact command to run. "
+        "A user-named verification command goes in verify_command; "
+        "never fold it into the task prose. "
         "REMINDERS: use create_reminder ONLY for an explicit reminder the "
         "user asked for ('remind me to ...'); merely mentioning a future "
         "task is never a reminder. Only two schedules exist: kind='once' "
