@@ -1,8 +1,7 @@
 # AI Assistant — current verified project state
 
-Checkpoint: **`9b2928d`** — *Merge feat/goose-gemini-35-flash-lite
-into main* (the latest code/test checkpoint, automated suite
-623 passed; follows `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`,
+Checkpoint: **`af88a6b`** — *docs: update README.md with auto-verification feature and current test count* (the latest code/test checkpoint, automated suite
+720 passed; follows `9b2928d`, `d27df2c`, `9e32be0`, `cc08eeb`, `ba6acce`,
 `f4514ae` — full chain back through `5ee950c`).
 Working tree matches the checkpoint except untracked `.vscode/`
 (IDE state, not project source); everything below is implemented,
