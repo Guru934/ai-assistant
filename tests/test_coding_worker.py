@@ -1267,9 +1267,9 @@ def test_delegate_routes_verify_through_sandbox(tmp_path, monkeypatch):
     calls = []
     real_verify = cw.verify_result
 
-    def _spy(req, result, sandbox=None):
+    def _spy(req, result, sandbox=None, **kwargs):
         calls.append(sandbox)
-        return real_verify(req, result, sandbox=sandbox)
+        return real_verify(req, result, sandbox=sandbox, **kwargs)
 
     monkeypatch.setattr(cw, "verify_result", _spy)
     monkeypatch.setattr(cw.shutil, "which",
@@ -1803,3 +1803,707 @@ def test_audit_failed_sandbox_setup_never_reports_sandboxed(
     assert any("sandbox setup failed" in m for m in messages)
     assert not any("sandbox=bwrap workspace" in m
                    and "launch" in m for m in messages)
+
+
+# ─── Conservative Python auto-verification ──────────────────────────
+# Ordinary tasks may run a fixed pytest argv after a successful
+# worker result. Explicit commands always win; nothing is invented.
+
+def _make_marker_ws(path, *names):
+    for name in names:
+        full = os.path.join(str(path), name)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write("# marker\n")
+    return str(path)
+
+
+def _auto_popen(monkeypatch, seen, probe_ok=True, pytest_code=0,
+                venv_probe_ok=None):
+    """Fake Popen dispatcher: worker, probe, and pytest runs."""
+    def _fake(argv, **kwargs):
+        seen.append(list(argv))
+        if "-c" in argv:
+            ok = (venv_probe_ok if ".venv" in str(argv[0])
+                  else probe_ok)
+            # Distinctive isolated-probe verdicts (10 found / 11
+            # missing); anything else means "not established".
+            return _FakePopen(out="", code=10 if ok else 11)
+        if "-m" in argv:
+            return _FakePopen(out="1 passed", code=pytest_code)
+        return _FakePopen(out="done", code=0)
+    monkeypatch.setattr(cw.subprocess, "Popen", _fake)
+    monkeypatch.setattr(cw.shutil, "which",
+                        lambda name: f"/usr/bin/{name}")
+
+
+def test_detect_strong_markers_and_test_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(cw, "_interpreter_has_pytest",
+                        lambda *a: True)
+    cases = (("pytest.ini",), ("conftest.py",),
+             ("test_calc.py",), ("calc_test.py",),
+             ("tests/test_calc.py",), ("test/test_calc.py",))
+    for i, names in enumerate(cases):
+        ws = tmp_path / ("ws%d" % i)
+        ws.mkdir()
+        _make_marker_ws(ws, *names)
+        argv, status, detail = cw.detect_python_checks(str(ws))
+        assert status == "ready", names
+        assert argv[-3:] == ["-m", "pytest", "-q"], names
+        assert "pytest -q" in detail, names
+
+
+def test_detect_ignores_generic_config_alone(tmp_path):
+    ws = tmp_path / "generic"
+    ws.mkdir()
+    _make_marker_ws(ws, "pyproject.toml", "setup.cfg", "tox.ini",
+                    "tests/helpers.py", "README.md")
+    argv, status, detail = cw.detect_python_checks(str(ws))
+    assert argv is None
+    assert status == "absent"
+    assert "no recognized" in detail
+    argv2, status2, _ = cw.detect_python_checks(
+        str(tmp_path / "missing-dir-xyz"))
+    assert argv2 is None and status2 == "absent"
+
+
+def test_detect_prefers_venv_python_over_python3(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    bindir = ws / ".venv" / "bin"
+    bindir.mkdir(parents=True)
+    venv_python = bindir / "python"
+    venv_python.write_text("#!/bin/sh\nexit 0\n")
+    os.chmod(str(venv_python), 0o755)
+    seen = []
+    _auto_popen(monkeypatch, seen, venv_probe_ok=True)
+    argv, status, detail = cw.detect_python_checks(str(ws))
+    assert status == "ready"
+    assert argv[0] == str(venv_python)
+    assert detail == ".venv/bin/python -m pytest -q"
+    # Venv without pytest falls back to python3 when it has it.
+    _auto_popen(monkeypatch, seen, probe_ok=True, venv_probe_ok=False)
+    argv2, status2, detail2 = cw.detect_python_checks(str(ws))
+    assert status2 == "ready"
+    assert argv2[0] == "/usr/bin/python3"
+    assert detail2 == "python3 -m pytest -q"
+
+
+def test_detect_unavailable_runner_is_not_code_failure(
+        tmp_path, monkeypatch, caplog):
+    import logging
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "pytest.ini", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen, probe_ok=False, venv_probe_ok=False)
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        out = delegate({"workspace": str(ws), "task": "fix bug",
+                        "auto_verify": True},
+                       provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: verification_unavailable" in out
+    assert "pytest" in out
+    assert "independently verified." not in out
+    assert "auto-detected project check" not in out
+    assert not any("-m" in a for a in seen)
+    assert any("unavailable" in r.getMessage() for r in caplog.records)
+
+
+def test_auto_check_pass_and_fail(tmp_path, monkeypatch):
+    for code, state in ((0, "independently_verified_pass"),
+                        (2, "independently_verified_fail")):
+        ws = tmp_path / ("run%d" % code)
+        ws.mkdir()
+        _make_marker_ws(ws, "tests/test_a.py")
+        seen = []
+        _auto_popen(monkeypatch, seen, pytest_code=code)
+        out = delegate({"workspace": str(ws), "task": "fix bug",
+                        "auto_verify": True},
+                       provider=SubprocessWorkerProvider(binary="true"))
+        assert f"Verification: {state}" in out, code
+        assert "auto-detected project check" in out, code
+        assert f"exit {code}" in out, code
+        pytest_runs = [a for a in seen if "-m" in a]
+        assert len(pytest_runs) == 1, code
+        assert pytest_runs[0][-3:] == ["-m", "pytest", "-q"], code
+
+
+def test_auto_check_absent_without_markers(tmp_path, monkeypatch):
+    ws = tmp_path / "plain"
+    ws.mkdir()
+    (ws / "notes.txt").write_text("hello\n")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": "fix bug",
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: unknown" in out
+    assert "auto-detected project check" not in out
+    assert not any("-m" in a for a in seen)
+
+
+def test_explicit_command_skips_detection(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "pytest.ini", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    calls = []
+    real_detect = cw.detect_python_checks
+    monkeypatch.setattr(cw, "detect_python_checks",
+                        lambda ws_: (calls.append(ws_), (None, "absent",
+                                                         "spy"))[1])
+    out = delegate({"workspace": str(ws), "task": "fix bug",
+                    "verify_command": ["true"], "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert calls == []
+    assert "Verification: independently_verified_pass" in out
+    assert "auto-detected project check" not in out
+    assert not any("-m" in a for a in seen)
+    assert real_detect is not None
+
+
+def test_guidance_keeps_ask_first_and_limits_auto_checks():
+    text = build_system_instructions()
+    assert "ask which exact command to run" in text
+    assert "routine auto-detected Python check" in text
+    assert ("never satisfies an explicit request for independent "
+            "verification" in text)
+    assert "instruction not to run tests disables it" in text
+
+
+def test_no_test_instruction_disables_auto_checks(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate(
+        {"workspace": str(ws),
+         "task": "fix bug but do not run tests", "auto_verify": True},
+        provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: unknown" in out
+    assert "auto-detected project check" not in out
+    assert not any("-m" in a for a in seen)
+
+
+def test_auto_check_runs_inside_bwrap_boundary(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    monkeypatch.delenv("CAT_TALKER_CODER_SANDBOX", raising=False)
+    out = delegate({"workspace": str(ws), "task": "fix bug",
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: independently_verified_pass" in out
+    pytest_runs = [a for a in seen if "-m" in a]
+    assert len(pytest_runs) == 1
+    assert pytest_runs[0][0] == "/usr/bin/bwrap"
+    assert "--" in pytest_runs[0]
+
+
+def test_ordinary_tool_approval_mentions_routine_checks(
+        tmp_path, _clean_pending):
+    from cat_talker.tools import confirm_action, run_coding_task
+    tools_mod = _clean_pending
+    paused = run_coding_task("fix bug", str(tmp_path))
+    assert "PAUSED FOR SAFETY" in paused
+    assert "routine auto-detected project checks may also run" in paused
+    pending = tools_mod.PENDING_RISKY_ACTION
+    assert pending["args"].get("auto_verify") is True
+    tools_mod.PENDING_RISKY_ACTION = None
+
+
+def test_no_auto_check_after_failed_worker(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "pytest.ini", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+
+    def _failing(argv, **kwargs):
+        seen.append(list(argv))
+        if "-c" in argv:
+            return _FakePopen(out="", code=0)
+        return _FakePopen(out="boom", code=1)
+    monkeypatch.setattr(cw.subprocess, "Popen", _failing)
+    out = delegate({"workspace": str(ws), "task": "fix bug",
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "independently_verified_pass" not in out
+    assert "auto-detected project check" not in out
+    assert not any("-m" in a for a in seen)
+
+
+# ─── Review blockers: sandboxed probes, ask-first guard, flag ────
+
+def test_probe_uses_configured_boundary(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    argv, status, _ = cw.detect_python_checks(str(ws), sandbox="bwrap")
+    assert status == "ready"
+    probes = [a for a in seen if "-c" in a]
+    assert len(probes) == 1
+    probe = probes[0]
+    assert probe[0] == "/usr/bin/bwrap"
+    assert "-I" in probe
+    code = probe[probe.index("-c") + 1]
+    assert "find_spec" in code
+    assert "import pytest" not in code
+
+
+def test_workspace_interpreter_never_runs_outside_boundary(
+        tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "tests/test_a.py")
+    bindir = ws / ".venv" / "bin"
+    bindir.mkdir(parents=True)
+    venv_python = bindir / "python"
+    venv_python.write_text("#!/bin/sh\nexit 0\n")
+    os.chmod(str(venv_python), 0o755)
+    seen = []
+    _auto_popen(monkeypatch, seen, venv_probe_ok=True)
+    argv, status, _ = cw.detect_python_checks(str(ws), sandbox="bwrap")
+    assert status == "ready"
+    assert argv[0] == str(venv_python)
+    probes = [a for a in seen if "-c" in a]
+    assert len(probes) == 1
+    # Workspace binary only ever appears after the sandbox separator,
+    # with the same restrictions as verification (no --ro-bind of the
+    # interpreter's own directory).
+    assert probes[0][0] == "/usr/bin/bwrap"
+    assert "--" in probes[0]
+    assert probes[0].index(str(venv_python)) > probes[0].index("--")
+    sep = probes[0].index("--")
+    binds = probes[0][:sep]
+    assert str(bindir) not in binds
+
+
+def _bwrap_executes(workspace: str) -> bool:
+    """Prove the sandbox can really execute (not just be installed)."""
+    import shutil as _shutil
+    if _shutil.which("bwrap") is None:
+        return False
+    true_bin = _shutil.which("true")
+    if not true_bin:
+        return False
+    argv, env, cleanup, error = cw._prepare_exec(
+        [true_bin], workspace, "bwrap", bind_binary_dir=False)
+    if error is not None:
+        return False
+    try:
+        returncode, _, _ = cw._run_bounded(argv, workspace, env, 30)
+    except Exception:
+        return False
+    finally:
+        if cleanup is not None:
+            try:
+                cleanup()
+            except Exception:
+                pass
+    return returncode == 0
+
+
+def test_evil_workspace_pytest_never_imported(tmp_path):
+    import shutil as _shutil
+    if _shutil.which("python3") is None:
+        pytest.skip("no system python3 for real-boundary probe")
+    ws = tmp_path / "evil"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py")
+    if not _bwrap_executes(str(ws)):
+        pytest.skip("bubblewrap sandbox execution unavailable; "
+                    "a failed setup must not pass as isolation evidence")
+    marker = ws / "PWNED"
+    (ws / "pytest.py").write_text(
+        "import os\n"
+        f"os.system('touch {marker}')\n")
+    # Sandboxed probe: real boundary, workspace code must not run.
+    # Ready (system-wide pytest) and established-unavailable (both
+    # probes returned the missing verdict) are both valid; anything
+    # else means execution was not proven and must fail loudly.
+    argv, status, detail = cw.detect_python_checks(str(ws),
+                                                   sandbox="bwrap")
+    assert not marker.exists()
+    assert status in ("ready", "unavailable"), detail
+    if status == "ready":
+        assert argv[-3:] == ["-m", "pytest", "-q"]
+        assert "pytest.py" not in " ".join(argv)
+    else:
+        assert "available in neither" in detail, detail
+    # Isolated probe without sandbox: -I still excludes the workspace.
+    argv2, status2, detail2 = cw.detect_python_checks(str(ws),
+                                                      sandbox=None)
+    assert not marker.exists()
+    assert status2 in ("ready", "unavailable"), detail2
+    if status2 == "unavailable":
+        assert "available in neither" in detail2, detail2
+
+
+def test_outside_workspace_interpreter_never_declared_ready(
+        tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py")
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    ran = bindir / "RAN"
+    fake = bindir / "python3"
+    fake.write_text("#!/bin/sh\n"
+                    f"touch {ran}\n"
+                    "exit 0\n")
+    os.chmod(str(fake), 0o755)
+    if not _bwrap_executes(str(ws)):
+        pytest.skip("bubblewrap sandbox execution unavailable")
+    import shutil as _shutil
+    monkeypatch.setenv("PATH", f"{bindir}:/usr/bin:/bin")
+    assert _shutil.which("python3") == str(fake)
+    argv, status, detail = cw.detect_python_checks(str(ws),
+                                                   sandbox="bwrap")
+    # The fake exits 0, yet it must never read as pytest found: it is
+    # invisible under verification's filesystem restrictions, and it
+    # must never have executed (here or anywhere outside them).
+    assert status == "unavailable", (status, detail)
+    assert "could not be established" in detail, detail
+    assert not ran.exists()
+
+
+def test_probe_setup_failure_never_falls_back(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "pytest.ini")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+
+    def _boom(*a, **k):
+        raise ValueError("Coding error: sandbox 'bwrap' requested but "
+                         "the 'bwrap' executable was not found on PATH.")
+    monkeypatch.setattr(cw, "_bwrap_wrap", _boom)
+    argv, status, detail = cw.detect_python_checks(str(ws),
+                                                   sandbox="bwrap")
+    assert argv is None
+    assert status == "unavailable"
+    assert seen == []
+
+
+def test_ask_first_guard_blocks_worker_without_command(
+        tmp_path, monkeypatch, _clean_pending):
+    from cat_talker.tools import run_coding_task
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    tools_mod = _clean_pending
+    out = run_coding_task(
+        "fix the login bug and verify it independently", str(tmp_path))
+    assert "exact verification command" in out
+    assert "Do not start the coding task yet" in out
+    assert tools_mod.PENDING_RISKY_ACTION is None
+    assert seen == []
+
+
+def test_ask_first_guard_precise_phrasing(tmp_path, monkeypatch,
+                                          _clean_pending):
+    from cat_talker.tools import run_coding_task
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    tools_mod = _clean_pending
+    # Explicit independent-verification demands trigger the guard.
+    for task in ("add square() with independent verification",
+                 "fix it; I want you to independently verify the fix"):
+        tools_mod.PENDING_RISKY_ACTION = None
+        out = run_coding_task(task, str(tmp_path))
+        assert "exact verification command" in out, task
+        assert tools_mod.PENDING_RISKY_ACTION is None, task
+    # Routine wording stays an ordinary task (approval pause, no ask).
+    for task in ("run the tests and repair failures",
+                 "add regression tests for square()",
+                 "verify the build passes",
+                 "check whether the tests pass"):
+        tools_mod.PENDING_RISKY_ACTION = None
+        out = run_coding_task(task, str(tmp_path))
+        assert "PAUSED FOR SAFETY" in out, task
+    tools_mod.PENDING_RISKY_ACTION = None
+
+
+def test_ask_first_guard_bypassed_by_explicit_command(
+        tmp_path, monkeypatch, _clean_pending):
+    from cat_talker.tools import run_coding_task_with_verification
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    tools_mod = _clean_pending
+    out = run_coding_task_with_verification(
+        "fix it and verify it independently", ["true"], str(tmp_path))
+    assert "PAUSED FOR SAFETY" in out
+    pending = tools_mod.PENDING_RISKY_ACTION
+    assert pending["args"].get("verify_command") == ["true"]
+    tools_mod.PENDING_RISKY_ACTION = None
+
+
+def test_auto_verify_rejects_non_boolean(tmp_path):
+    with pytest.raises(ValueError, match="auto_verify"):
+        build_request(str(tmp_path), "fix bug",
+                      auto_verify="false")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="auto_verify"):
+        build_request(str(tmp_path), "fix bug",
+                      auto_verify=1)  # type: ignore[arg-type]
+    assert build_request(str(tmp_path), "fix bug",
+                         auto_verify=True).auto_verify is True
+    assert build_request(str(tmp_path), "fix bug").auto_verify is False
+
+
+# ─── Final review: negation, tri-state probes, portability ──────
+
+def test_negated_verification_requests_skip_guard(tmp_path, monkeypatch,
+                                                 _clean_pending):
+    from cat_talker.tools import run_coding_task
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    tools_mod = _clean_pending
+    for task in ("fix the bug; no independent verification is needed",
+                 "do not perform independent verification",
+                 "fix it without independent verification, just do it"):
+        tools_mod.PENDING_RISKY_ACTION = None
+        out = run_coding_task(task, str(tmp_path))
+        assert "PAUSED FOR SAFETY" in out, task
+        assert "exact verification command" not in out, task
+    tools_mod.PENDING_RISKY_ACTION = None
+
+
+def test_probe_indeterminate_reports_unavailable_honestly(
+        tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "pytest.ini")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    # Probe can establish nothing (e.g. timeout): None, not False.
+    monkeypatch.setattr(cw, "_interpreter_has_pytest", lambda *a: None)
+    argv, status, detail = cw.detect_python_checks(str(ws),
+                                                   sandbox="bwrap")
+    assert argv is None
+    assert status == "unavailable"
+    assert "could not be established" in detail
+    assert "not assuming pytest is absent" in detail
+    # Confirmed absence keeps the distinct, stronger message.
+    monkeypatch.setattr(cw, "_interpreter_has_pytest", lambda *a: False)
+    argv2, status2, detail2 = cw.detect_python_checks(str(ws),
+                                                      sandbox="bwrap")
+    assert status2 == "unavailable"
+    assert "available in neither" in detail2
+    assert "could not be established" not in detail2
+
+
+def test_indeterminate_probe_never_claims_absence(tmp_path, monkeypatch,
+                                                 caplog):
+    import logging
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    monkeypatch.setattr(cw, "_interpreter_has_pytest", lambda *a: None)
+    with caplog.at_level(logging.INFO,
+                         logger="cat_talker.coding_worker"):
+        out = delegate({"workspace": str(ws), "task": "fix bug",
+                        "auto_verify": True},
+                       provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: verification_unavailable" in out
+    assert "could not be established" in out
+    assert "independently verified." not in out
+    assert not any("-m" in a for a in seen)
+
+
+def test_confirmed_absent_probe_message_preserved(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py")
+    seen = []
+    _auto_popen(monkeypatch, seen, probe_ok=False, venv_probe_ok=False)
+    out = delegate({"workspace": str(ws), "task": "fix bug",
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: verification_unavailable" in out
+    assert "available in neither" in out
+
+
+# ─── Opt-out variations disable automatic checks ────────────────
+
+@pytest.mark.parametrize("task", [
+    "fix the bug; do not run any tests",
+    "fix the bug; don't run any tests",
+    "fix it but don't run pytest",
+    "fix it but do not run pytest",
+    "avoid running tests for now, just fix it",
+    "avoid running pytest, the env is broken",
+    "skip all checks and only make the change",
+    "skip all tests, I will run them myself",
+    "never run checks on this workspace",
+    "do not execute tests after the fix",
+    "without executing tests, apply the patch",
+    "stop running tests here",
+])
+def test_opt_out_variations_disable_auto_checks(tmp_path, monkeypatch,
+                                                task):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": task,
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: unknown" in out, task
+    assert "auto-detected project check" not in out, task
+    assert not any("-m" in a for a in seen), task
+
+
+def test_opt_out_preserves_explicit_command(tmp_path, monkeypatch):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws),
+                    "task": "fix the bug; do not run any tests",
+                    "verify_command": ["true"], "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: independently_verified_pass" in out
+    assert "auto-detected project check" not in out
+    assert not any("-m" in a for a in seen)
+
+
+# ─── Opposite instructions are not opt-outs ─────────────────────
+
+@pytest.mark.parametrize("task", [
+    "fix the bug; do not skip tests",
+    "fix the bug; don't skip tests",
+    "fix it; do not skip pytest",
+    "fix it; don't skip pytest",
+    "we should not skip tests for this change",
+])
+def test_opposite_instructions_keep_auto_checks(tmp_path, monkeypatch,
+                                                task):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": task,
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: independently_verified_pass" in out, task
+    assert "auto-detected project check" in out, task
+    assert any("-m" in a for a in seen), task
+
+
+@pytest.mark.parametrize("task", [
+    "fix the bug; do not run any checks",
+    "fix the bug; don't run any checks",
+    "fix it; do not execute any checks",
+    "fix it; don't execute any checks",
+    "fix the bug; do not run any tests",
+    "fix it; avoid running tests",
+    "skip all checks and only make the change",
+])
+def test_genuine_opt_outs_suppress_auto_checks(tmp_path, monkeypatch,
+                                               task):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": task,
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: unknown" in out, task
+    assert "auto-detected project check" not in out, task
+    assert not any("-m" in a for a in seen), task
+
+
+# ─── Opt-out precedence: contradictory instructions ──────────────
+
+@pytest.mark.parametrize("task,should_allow", [
+    # Genuine opt-outs → block
+    ("fix the bug; do not run tests", False),
+    ("fix the bug; do not run any tests", False),
+    ("fix the bug; don't run pytest", False),
+    ("fix it; avoid running tests", False),
+    ("fix it; do not run any checks", False),
+    ("fix it; don't execute any checks", False),
+    # Opposite phrases → allow
+    ("fix the bug; do not skip tests", True),
+    ("fix the bug; don't skip tests", True),
+    ("fix it; do not skip pytest", True),
+    ("fix it; don't skip pytest", True),
+    ("we should not skip tests for this change", True),
+])
+def test_opt_out_precedence_single_instruction(tmp_path, monkeypatch,
+                                                task, should_allow):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": task,
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    if should_allow:
+        assert "Verification: independently_verified_pass" in out, task
+        assert "auto-detected project check" in out, task
+        assert any("-m" in a for a in seen), task
+    else:
+        assert "Verification: unknown" in out, task
+        assert "auto-detected project check" not in out, task
+        assert not any("-m" in a for a in seen), task
+
+
+@pytest.mark.parametrize("task,should_allow", [
+    # Contradictory both orders → block (conservative)
+    ("do not run tests but do not skip tests", False),
+    ("do not skip tests but do not run tests", False),
+    ("don't run any tests; don't skip tests either", False),
+    ("avoid running tests, also do not skip tests", False),
+    ("do not run any checks, we should not skip tests", False),
+    ("don't skip tests but do not run pytest", False),
+])
+def test_contradictory_instructions_block(tmp_path, monkeypatch,
+                                          task, should_allow):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": task,
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: unknown" in out, task
+    assert "auto-detected project check" not in out, task
+    assert not any("-m" in a for a in seen), task
+
+
+@pytest.mark.parametrize("task", [
+    "fix the bug; do not skip tests",
+    "fix the bug; don't skip tests",
+    "fix it; do not skip pytest",
+    "fix it; don't skip pytest",
+    "we should not skip tests for this change",
+])
+def test_opposite_only_allows(tmp_path, monkeypatch, task):
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _make_marker_ws(ws, "conftest.py", "tests/test_a.py")
+    seen = []
+    _auto_popen(monkeypatch, seen)
+    out = delegate({"workspace": str(ws), "task": task,
+                    "auto_verify": True},
+                   provider=SubprocessWorkerProvider(binary="true"))
+    assert "Verification: independently_verified_pass" in out, task
+    assert "auto-detected project check" in out, task
+    assert any("-m" in a for a in seen), task

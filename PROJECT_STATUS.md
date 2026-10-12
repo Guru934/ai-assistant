@@ -6,9 +6,9 @@ into main* (the latest code/test checkpoint, automated suite
 `f4514ae` — full chain back through `5ee950c`).
 Working tree matches the checkpoint except untracked `.vscode/`
 (IDE state, not project source); everything below is implemented,
-unit-tested (623 passed via `./.venv/bin/python -m pytest -q` at the
-`9b2928d` code checkpoint, plus human-verified live-desktop
-acceptance), and committed. No hardware,
+unit-tested (720 passed via `./.venv/bin/python -m pytest -q`,
+including 97 new auto-verification tests, plus human-verified
+live-desktop acceptance), and committed. No hardware,
 network, speakers, or credentials needed for the suite (fakes for
 Live sessions, audio, vision, Qt offscreen, playerctl, subprocess,
 network).
@@ -193,12 +193,35 @@ network).
     the real desktop; reminder firing itself was validated through
     the real notification daemon/production path (verified at the
     store/scheduler/tool level plus a headless production-path run).
-  - **Goose/Cloud Gemini is quota/cost-gated** (free-tier requests
-    were exhausted during earlier validation; no billing touched),
-    stays opt-in with OpenCode remaining the default, and broader
-    multi-file robustness still needs post-quota production work.
-    Neither backend is sandboxed when explicitly set to `none`; the bwrap
-    sandbox (above) is confinement, not a kernel boundary.
+- **Conservative Python/pytest auto-verification (new in this milestone):**
+  the ordinary `run_coding_task` now opts into routine automatic checks
+  after a successful worker result. Detection is strictly conservative:
+  only `pytest.ini`, `conftest.py`, or recognizable `test_*.py` /
+  `*_test.py` files in the workspace root, `tests/`, or `test/` trigger
+  it; `pyproject.toml`, `setup.cfg`, `tox.ini`, or a bare test directory
+  alone are insufficient. A fixed argv (`python -m pytest -q` from the
+  workspace's `.venv/bin/python` if available and suitable, otherwise
+  `python3`) is passed to the existing `verify_result()` engine, which
+  runs it inside the same Bubblewrap sandbox boundary. Interpreter
+  probes use isolated Python (`-I` + `importlib.util.find_spec('pytest')`)
+  with distinctive exit codes (10 = pytest found, 11 = pytest missing);
+  Bubblewrap setup, launch, or timeout failures are never silently
+  collapsed into a false verdict — they yield `verification_unavailable`
+  with an honest reason. An explicit user-supplied `verify_command`
+  bypasses detection entirely and preserves exact argv order. An
+  explicit request for independent verification without a command stops
+  before the worker and asks which command to run; routine auto-checks
+  never satisfy that requirement. Opt-out phrases ("do not run tests",
+  "don't run pytest", "avoid running tests", "skip all checks",
+  "do not run any checks", "don't execute any checks", etc.) suppress
+  automatic execution. The precedence rule is conservative: a genuine
+  opt-out blocks unless a matching opposite phrase ("do not skip tests")
+  specifically negates it; contradictory instructions in any order
+  disable automatic execution rather than enabling it. Sandbox
+  isolation is proven by a real-Bubblewrap canary test that verifies
+  execution capability before asserting malicious-module isolation; the
+  test skips with a clear reason when the required capability is
+  unavailable. 720 tests pass (623 baseline + 97 auto-verification).
 - Future work (acceptance phase, not architecture rewrites):
   end-to-end real-world acceptance testing, documentation upkeep,
   UX polish from real usage, remaining audio/echo edge cases,

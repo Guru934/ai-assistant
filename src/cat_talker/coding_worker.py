@@ -125,6 +125,11 @@ class WorkerRequest:
     # only run what the caller explicitly supplied (e.g. this repo's own
     # "./.venv/bin/python -m pytest -q"). None means no command check.
     verify_command: object = None
+    # Ordinary-tool hygiene only: when True and no explicit
+    # verify_command was supplied, delegate() may run a conservatively
+    # auto-detected project check (never invented, fixed argv). An
+    # explicit verify_command always wins; False disables detection.
+    auto_verify: bool = False
 
     def validated(self) -> "WorkerRequest":
         if not isinstance(self.task, str) or not self.task.strip():
@@ -146,21 +151,28 @@ class WorkerRequest:
                     "Coding error: verify_command must be a non-empty "
                     "argv list of strings.")
             verify = tuple(verify)
+        auto = self.auto_verify
+        if not isinstance(auto, bool):
+            raise ValueError(
+                "Coding error: auto_verify must be a boolean.")
         return WorkerRequest(workspace=workspace,
                              task=self.task.strip(),
                              constraints=constraints.strip(),
                              timeout=timeout,
-                             verify_command=verify)
+                             verify_command=verify,
+                             auto_verify=auto)
 
 
 def build_request(workspace: str, task: str, constraints: str = "",
                   timeout: int = WORKER_TIMEOUT_DEFAULT,
-                  verify_command=None) -> WorkerRequest:
+                  verify_command=None,
+                  auto_verify: bool = False) -> WorkerRequest:
     """Construct and validate a worker request. Raises on any problem."""
     return WorkerRequest(workspace=workspace, task=task,
                          constraints=constraints,
                          timeout=timeout,
-                         verify_command=verify_command).validated()
+                         verify_command=verify_command,
+                         auto_verify=auto_verify).validated()
 
 
 @dataclass
@@ -396,8 +408,249 @@ def result_from_process(returncode: int, stdout: str, stderr: str,
                             verification="unknown")
 
 
+# ─── conservative Python/pytest auto-detection ────────────────
+#
+# Ordinary tasks only: fixed argv, never parsed from project files.
+# A candidate needs a STRONG marker (pytest.ini, conftest.py) or a
+# recognizable test file (test_*.py / *_test.py) in the workspace
+# root, tests/, or test/. Generic config (pyproject.toml, setup.cfg,
+# tox.ini) or a bare tests/ directory alone is NOT proof of pytest.
+# Runner suitability is probed inside the verification execution
+# boundary (isolated mode + find_spec, never a real import), never
+# assumed; nothing is installed. Returns (argv|None, status, detail)
+# with status one of "ready" | "unavailable" | "absent".
+
+AUTO_CHECK_PROBE_TIMEOUT = 30
+AUTO_CHECK_TEST_DIRS = ("tests", "test")
+
+# Isolated availability probe: -I drops cwd, PYTHONPATH, and user
+# site; find_spec locates pytest WITHOUT importing it, so a
+# workspace-controlled pytest.py can never execute during detection.
+# Distinctive exits (10 found / 11 missing) keep the verdict
+# unambiguous: launcher failures (bwrap exec errors exit 1, missing
+# binaries 127, timeouts) can never masquerade as either verdict.
+_PYTEST_PROBE_FOUND = 10
+_PYTEST_PROBE_MISSING = 11
+_PYTEST_PROBE_CODE = (
+    "import importlib.util,sys;"
+    "sys.exit(10 if importlib.util.find_spec('pytest') else 11)")
+
+# Explicit user opt-outs: when the task or constraints contain one of
+# these, automatic checks are skipped (explicit verify_command still
+# runs - it was directly requested). Plain substring phrases only, no
+# parsing: every entry pairs an opt-out cue (not/n't/never/avoid/
+# skip/without/stop) with running or executing tests, pytest, or
+# checks, so routine wording like "run the tests and fix failures"
+# never matches.
+_NO_AUTO_CHECK_PHRASES = (
+    "do not run tests", "don't run tests",
+    "do not run the tests", "don't run the tests",
+    "do not run any tests", "don't run any tests",
+    "do not run pytest", "don't run pytest",
+    "do not run checks", "don't run checks",
+    "do not run any checks", "don't run any checks",
+    "do not execute tests", "don't execute tests",
+    "do not execute any tests", "don't execute any tests",
+    "do not execute pytest", "don't execute pytest",
+    "do not execute checks", "don't execute checks",
+    "do not execute any checks", "don't execute any checks",
+    "do not run all tests", "don't run all tests",
+    "never run tests", "never run pytest", "never run checks",
+    "never execute tests",
+    "avoid running tests", "avoid running pytest",
+    "avoid running checks",
+    "avoid executing tests", "avoid executing pytest",
+    "skip tests", "skip the tests", "skip testing", "skip checks",
+    "skip all tests", "skip all checks",
+    "skip pytest", "skip any tests",
+    "without running tests", "without running checks",
+    "without executing tests",
+    "stop running tests",
+    "do not verify", "don't verify",
+    "no verification", "skip verification",
+)
+
+# Opposite instructions: the user affirmatively asks NOT to skip
+# checks ("do not skip tests"). These contain an opt-out phrase as a
+# substring ("skip tests") but mean the reverse. The resolution
+# algorithm collects all opt-out phrases present in the request,
+# then any matching opposite phrase negates only its corresponding
+# opt-out (e.g., "do not skip tests" negates opt-outs containing
+# "skip tests"). After negation, if any opt-out remains un-negated,
+# automatic checks are disabled. This conservative rule ensures
+# contradictory instructions never enable execution by accident.
+_NOT_AN_OPTOUT_PHRASES = (
+    "do not skip tests", "don't skip tests",
+    "do not skip pytest", "don't skip pytest",
+    "do not skip checks", "don't skip checks",
+    "should not skip tests", "should not skip pytest",
+    "should not skip checks",
+    "never skip tests", "never skip checks",
+)
+
+
+def _looks_like_pytest_file(name: str) -> bool:
+    if not isinstance(name, str) or not name.endswith(".py"):
+        return False
+    base = name[:-3]
+    return base.startswith("test_") or base.endswith("_test")
+
+
+def _auto_checks_allowed(request: WorkerRequest) -> bool:
+    text = " ".join(s for s in (request.task, request.constraints)
+                    if isinstance(s, str)).lower()
+
+    # Find all opt-out phrases present in the text
+    present_opt_outs = {p for p in _NO_AUTO_CHECK_PHRASES if p in text}
+    if not present_opt_outs:
+        return True
+
+    # Find all opposite phrases present
+    present_opposites = {p for p in _NOT_AN_OPTOUT_PHRASES if p in text}
+    if not present_opposites:
+        return False  # genuine opt-outs present, no opposites to negate them
+
+    # Each opposite phrase only negates its specific matching opt-out.
+    # An opposite "do not skip X" negates opt-outs containing "skip X".
+    # It does NOT negate opt-outs about running/executing/avoiding.
+    negated_opt_outs = set()
+    for opp in present_opposites:
+        # Extract the activity being negated: "do not skip X" → "skip X"
+        if opp.startswith("do not skip "):
+            activity = "skip " + opp[len("do not skip "):]
+        elif opp.startswith("don't skip "):
+            activity = "skip " + opp[len("don't skip "):]
+        elif opp.startswith("should not skip "):
+            activity = "skip " + opp[len("should not skip "):]
+        elif opp.startswith("never skip "):
+            activity = "skip " + opp[len("never skip "):]
+        else:
+            continue
+        # Negate any opt-out that contains this activity
+        for opt_out in present_opt_outs:
+            if activity in opt_out:
+                negated_opt_outs.add(opt_out)
+
+    # Remaining opt-outs after negation
+    remaining_opt_outs = present_opt_outs - negated_opt_outs
+    return len(remaining_opt_outs) == 0
+
+
+def _interpreter_has_pytest(python: str, workspace: str,
+                            sandbox=None):
+    """Probe-only: is pytest resolvable for this interpreter?
+
+    Runs inside the SAME execution boundary as the later check (see
+    _prepare_exec): isolated mode plus find_spec, so no
+    workspace-controlled code ever executes here. Uses the same
+    filesystem restrictions as verification (bind_binary_dir=False):
+    a detected interpreter must already be reachable through the
+    workspace or system bindings - the probe never grants broader
+    access than the eventual check would have. Returns True
+    (pytest found), False (find_spec confirms it is missing), or None
+    (availability NOT established: timeout, setup failure, launch
+    error, or any other exit - launcher failures use different codes
+    and can never read as a verdict). None is never a
+    license for an unsandboxed run - callers must report it honestly.
+    Bounded by AUTO_CHECK_PROBE_TIMEOUT with cleanup. No installs.
+    """
+    argv, env, cleanup, error = _prepare_exec(
+        [python, "-I", "-c", _PYTEST_PROBE_CODE], workspace, sandbox,
+        bind_binary_dir=False)
+    if error is not None:
+        logger.warning(
+            "coding pytest probe setup failed: sandbox=%s workspace=%s "
+            "error=%s (not executed)", _sandbox_label(sandbox),
+            workspace, error)
+        return None
+    try:
+        try:
+            returncode, _, _ = _run_bounded(
+                argv, workspace, env, AUTO_CHECK_PROBE_TIMEOUT)
+        except (FileNotFoundError, OSError):
+            return None
+        except Exception:
+            return None
+        if returncode == _PYTEST_PROBE_FOUND:
+            return True
+        if returncode == _PYTEST_PROBE_MISSING:
+            return False
+        return None
+    finally:
+        if cleanup is not None:
+            cleanup()
+
+
+def detect_python_checks(workspace: str, sandbox=None) -> tuple:
+    """Conservative pytest detection. Pure except for probe subprocesses.
+
+    Probes run inside the given verification execution boundary
+    (None = explicit unsandboxed compat mode, "bwrap" = bubblewrap).
+    Returns (argv|None, status, detail). argv is always a fixed list
+    (never shell, never parsed from files). "ready" means markers plus
+    a proven runner; "unavailable" means markers but no runner;
+    "absent" means no confident identification.
+    """
+    try:
+        top = set(os.listdir(workspace))
+    except OSError as e:
+        return None, "absent", f"workspace not listable: {e}"
+    strong = "pytest.ini" in top or "conftest.py" in top
+    found = any(_looks_like_pytest_file(n) for n in top)
+    if not (strong or found):
+        for sub in AUTO_CHECK_TEST_DIRS:
+            subdir = os.path.join(workspace, sub)
+            try:
+                names = os.listdir(subdir)
+            except OSError:
+                continue
+            if not os.path.isdir(subdir):
+                continue
+            if any(_looks_like_pytest_file(n) for n in names):
+                found = True
+                break
+    if not (strong or found):
+        return (None, "absent",
+                "no recognized Python/pytest markers (pytest.ini, "
+                "conftest.py, or test_*.py/*_test.py in the workspace "
+                "root, tests/, or test/)")
+    venv_python = os.path.join(workspace, ".venv", "bin", "python")
+    if os.path.isfile(venv_python) and os.access(venv_python, os.X_OK):
+        venv_state = _interpreter_has_pytest(venv_python, workspace,
+                                             sandbox)
+    else:
+        venv_state = "skipped"
+    if venv_state is True:
+        return ([venv_python, "-m", "pytest", "-q"], "ready",
+                ".venv/bin/python -m pytest -q")
+    python3 = shutil.which("python3")
+    py3_state = (_interpreter_has_pytest(python3, workspace, sandbox)
+                 if python3 else "skipped")
+    if py3_state is True:
+        return ([python3, "-m", "pytest", "-q"], "ready",
+                "python3 -m pytest -q")
+    # Never claim absence from an unestablished probe: any None means
+    # availability is unknown, not missing.
+    if venv_state == "skipped" and py3_state == "skipped":
+        return (None, "unavailable",
+                "recognized Python/pytest markers present but no usable "
+                "Python interpreter was found (no .venv/bin/python, no "
+                "python3 on PATH)")
+    if venv_state is not None and py3_state is not None:
+        return (None, "unavailable",
+                "recognized Python/pytest markers present but pytest is "
+                "available in neither .venv/bin/python nor python3; "
+                "not installing dependencies")
+    return (None, "unavailable",
+            "recognized Python/pytest markers present but pytest "
+            "availability could not be established (probe or sandbox "
+            "setup failed); not assuming pytest is absent and not "
+            "installing dependencies")
+
+
 def verify_result(request: WorkerRequest, result: WorkerResult,
-                  sandbox=None) -> WorkerResult:
+                  sandbox=None, auto_source: str | None = None
+                  ) -> WorkerResult:
     """Independently check a worker result against the workspace.
 
     Never raises. Only ever upgrades information, never success:
@@ -406,6 +659,10 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
     - an explicit request.verify_command (argv, bounded, cwd=workspace)
       decides independently_verified_pass/fail;
     - otherwise the worker claim stands, explicitly unverified.
+
+    auto_source names an auto-detected project check (e.g.
+    "python3 -m pytest -q") so the bounded output is labeled as
+    routine hygiene, never as a user-supplied command.
 
     sandbox selects the verification execution boundary: None runs
     the command directly (historic behavior); "bwrap" runs it inside
@@ -439,28 +696,22 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
         if not cmd_list:
             return result
         vsandbox = _sandbox_label(sandbox)
-        if sandbox is None:
-            argv, env, cleanup = cmd_list, None, None
-        elif sandbox == "bwrap":
-            home = _make_sandbox_home()
-            # No binary-dir binding here: verification commands must
-            # already live in /usr or the workspace, otherwise they
-            # fail honestly instead of punching holes (see _bwrap_wrap).
-            try:
-                argv, env = _bwrap_wrap(cmd_list, workspace, home, None,
-                                        bind_binary_dir=False)
-            except ValueError as e:
-                shutil.rmtree(home, ignore_errors=True)
+        # Verification commands must already live in /usr or the
+        # workspace (bind_binary_dir=False): an absolute outside path
+        # must fail honestly instead of punching its own directory
+        # into the sandbox (see _bwrap_wrap).
+        argv, env, cleanup, prep_error = _prepare_exec(
+            cmd_list, workspace, sandbox, bind_binary_dir=False)
+        if prep_error is not None:
+            if sandbox == "bwrap":
                 result.verification = "unknown"
-                result.error = f"Verification could not run: {e}"
+                result.error = f"Verification could not run: {prep_error}"
                 logger.error(
                     "coding verification sandbox setup failed: "
                     "sandbox=bwrap workspace=%s error=%s "
                     "(not executed; never reported as sandboxed)",
-                    workspace, e)
+                    workspace, prep_error)
                 return result
-            cleanup = lambda: shutil.rmtree(home, ignore_errors=True)
-        else:
             result.verification = "unknown"
             result.error = (f"Verification misconfigured: unknown "
                             f"sandbox '{sandbox}'.")
@@ -492,6 +743,14 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
             if cleanup is not None:
                 cleanup()
         summary, _ = _verify_summary(out_text or "", err_text or "")
+        if auto_source:
+            tagged = (f"[auto-detected project check: {auto_source}]"
+                      + ("\n" + summary if summary else ""))
+            if len(tagged) <= VERIFY_SUMMARY_MAX_CHARS:
+                summary = tagged
+            else:
+                summary = (tagged[:VERIFY_SUMMARY_MAX_CHARS]
+                           + VERIFY_TRUNCATION_NOTE)
         result.verify_exit = returncode
         result.verify_output = summary
         if returncode == 0:
@@ -504,8 +763,9 @@ def verify_result(request: WorkerRequest, result: WorkerResult,
                 f"(exit {returncode}): {clipped[:500]}")
         logger.info(
             "coding verification: sandbox=%s workspace=%s outcome=%s "
-            "exit=%s", vsandbox, workspace, result.verification,
-            returncode)
+            "exit=%s source=%s", vsandbox, workspace, result.verification,
+            returncode,
+            ("auto:" + auto_source) if auto_source else "explicit")
         return result
     except Exception as e:
         try:
@@ -946,6 +1206,34 @@ def _sandbox_label(sandbox) -> str:
     return "unknown"
 
 
+def _prepare_exec(cmd_list, workspace: str, sandbox,
+                  bind_binary_dir: bool):
+    """Build the real execution triple for a workspace command.
+
+    Returns (argv, env, cleanup, error). error None means argv may be
+    executed exactly once within the stated boundary; otherwise
+    nothing may run (setup failure or unknown sandbox - never fall
+    back to an unsandboxed execution). cleanup removes the throwaway
+    sandbox home (None when there is none).
+    """
+    if sandbox is None:
+        return list(cmd_list), None, None, None
+    if sandbox == SANDBOX_BWRAP:
+        try:
+            home = _make_sandbox_home()
+        except OSError as e:
+            return None, None, None, f"could not create sandbox: {e}"
+        try:
+            argv, env = _bwrap_wrap(cmd_list, workspace, home, None,
+                                    bind_binary_dir=bind_binary_dir)
+        except ValueError as e:
+            shutil.rmtree(home, ignore_errors=True)
+            return None, None, None, str(e)
+        return (argv, env,
+                lambda: shutil.rmtree(home, ignore_errors=True), None)
+    return None, None, None, f"unknown sandbox '{sandbox}'"
+
+
 def _backend_label(provider: WorkerProvider) -> str:
     """Honest backend label from the resolved provider (never config).
 
@@ -1061,7 +1349,40 @@ def delegate(request: WorkerRequest | dict,
         result.backend = backend
         result.sandbox = boundary
         sandbox = getattr(engine, "verify_sandbox", None)
-        return verify_result(req, result, sandbox=sandbox).render()
+        auto_source = None
+        if (req.auto_verify and result.ok
+                and req.validated().verify_command is None):
+            if not _auto_checks_allowed(req):
+                logger.info("coding auto check skipped: workspace=%s "
+                            "reason=user opted out", req.workspace)
+            else:
+                detected, status, detail = detect_python_checks(
+                    req.workspace, sandbox)
+                if status == "ready" and detected:
+                    from dataclasses import replace as _replace
+                    req = _replace(req,
+                                   verify_command=tuple(detected))
+                    auto_source = detail
+                    logger.info(
+                        "coding auto check selected: backend=%s "
+                        "sandbox=%s workspace=%s command=%s",
+                        backend, _sandbox_label(sandbox),
+                        req.workspace, detail)
+                elif status == "unavailable":
+                    result.verification = "verification_unavailable"
+                    result.verify_output = detail
+                    result.error = detail
+                    logger.warning(
+                        "coding auto check unavailable: backend=%s "
+                        "sandbox=%s workspace=%s reason=%s",
+                        backend, _sandbox_label(sandbox),
+                        req.workspace, detail)
+                    return result.render()
+                else:
+                    logger.debug("coding auto check absent: workspace=%s",
+                                 req.workspace)
+        return verify_result(req, result, sandbox=sandbox,
+                             auto_source=auto_source).render()
     except (ValueError, PermissionError) as e:
         return str(e)
     except Exception as e:

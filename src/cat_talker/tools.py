@@ -320,13 +320,55 @@ def read_aloud(text: str) -> str:
 # reuses the same spoken-approval flow as click/type/press: the first
 # call pauses for an out-loud "yes", confirm_action runs it.
 
+# Conservative explicit-verification intent: ONLY phrases where the
+# user asks for independent verification as a distinct requirement.
+# Routine wording ('run the tests', 'add tests', 'verify the build',
+# bare 'verify'/'test') never matches - those stay ordinary tasks.
+# Negated requests ('no independent verification is needed') never
+# match either - checked first, still without any NLP framework.
+_EXPLICIT_VERIFY_INTENT = (
+    "independent verification",
+    "independently verify",
+    "verify independently",
+    "verify it independently",
+    "independent check of",
+)
+
+_EXPLICIT_VERIFY_NEGATION = (
+    "no independent verification",
+    "without independent verification",
+    "do not perform independent verification",
+    "don't perform independent verification",
+    "do not verify independently",
+    "don't verify independently",
+    "never verify independently",
+    "independent verification is not needed",
+    "independent verification not needed",
+    "no need for independent verification",
+    "not independently verify",
+)
+
+
+def _requires_explicit_verification(task: str) -> bool:
+    """True when the task text explicitly demands independent
+    verification (so the exact command must be asked for first)."""
+    if not isinstance(task, str):
+        return False
+    lowered = task.lower()
+    if any(phrase in lowered for phrase in _EXPLICIT_VERIFY_NEGATION):
+        return False
+    return any(phrase in lowered for phrase in _EXPLICIT_VERIFY_INTENT)
+
+
 def _delegate_coding(task: str, workspace: str,
-                     verify_command=None) -> str:
-    def _execute(task, workspace, verify_command=None):
+                     verify_command=None, auto_verify: bool = False) -> str:
+    def _execute(task, workspace, verify_command=None,
+                 auto_verify: bool = False):
         try:
             from cat_talker.coding_worker import build_request, delegate
             return delegate(build_request(workspace, task,
-                                          verify_command=verify_command))
+                                          verify_command=verify_command,
+                                          auto_verify=auto_verify))
         except Exception as e:
             return f"Coding task FAILED.\nError: {e}"
 
@@ -340,10 +382,27 @@ def _delegate_coding(task: str, workspace: str,
             return str(e)
     except Exception as e:
         return f"Coding task FAILED.\nError: {e}"
+    if verify_command is None and _requires_explicit_verification(task):
+        # Runtime ask-first guard: the user explicitly requires
+        # independent verification but named no command. Do NOT start
+        # the worker and do NOT pause for approval - a routine
+        # auto-detected check could never satisfy this requirement.
+        return ("I need the exact verification command before starting: "
+                "ask the user out loud which exact command to run "
+                "(argv, e.g. python3 test_calc.py), then call "
+                "run_coding_task_with_verification with exactly that "
+                "command. Do not start the coding task yet, and do not "
+                "invent or substitute a command.")
+    if auto_verify:
+        desc = ("delegate this coding task to the coding worker "
+                "(routine auto-detected project checks may also run)")
+    else:
+        desc = "delegate this coding task to the coding worker"
     return _handle_risky("run_coding_task", _execute,
                          {"task": task, "workspace": workspace,
-                          "verify_command": verify_command},
-                         "delegate this coding task to the coding worker")
+                          "verify_command": verify_command,
+                          "auto_verify": auto_verify},
+                         desc)
 
 
 def run_coding_task(task: str, workspace: str = "") -> str:
@@ -361,15 +420,21 @@ def run_coding_task(task: str, workspace: str = "") -> str:
     This ordinary tool is NOT for requests requiring caller-specified
     independent verification: when the user names an exact verification
     command, use run_coding_task_with_verification instead - never fold
-    the command into the task prose here. Verification stays unknown
-    and worker-run tests are never promoted to independent
-    verification. Never raises: failures return honest error strings.
+    the command into the task prose here. Without an explicit command,
+    a successful result may run a routine auto-detected Python check
+    (fixed pytest argv, same sandbox and approval); the approval
+    question says so. A routine check never satisfies an explicit
+    request for independent verification, and an explicit user
+    instruction not to run tests disables it. Without any check,
+    verification stays unknown and worker-run tests are never promoted
+    to independent verification. Never raises: failures return honest
+    error strings.
 
     Args:
         task: Coding task description (required, non-empty).
         workspace: Explicit repository path (required).
     """
-    return _delegate_coding(task, workspace)
+    return _delegate_coding(task, workspace, auto_verify=True)
 
 
 def run_coding_task_with_verification(task: str,

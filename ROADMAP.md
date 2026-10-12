@@ -57,6 +57,14 @@ Completed (current GitHub checkpoint `9b2928d` with 623 automated tests passing;
 ├── Bubblewrap worker sandbox, on by default (workspace-only view,
 │   throwaway HOME, private /tmp, shared network, fail-closed;
 │   verification inside the same boundary; `none` escape hatch)
+├── Conservative Python/pytest auto-verification (auto-detected
+│   `pytest.ini`/`conftest.py`/`test_*.py`/`*_test.py`; fixed
+│   `[-m pytest -q]` argv; interpreter probes use isolated `-I`
+│   `find_spec('pytest')` with distinctive 10/11 exits inside the
+│   same sandbox boundary; Bubblewrap setup failure never falls
+│   back; explicit `verify_command` bypasses detection; opt-out
+│   phrases with conservative precedence — genuine opt-outs block
+│   unless specifically negated by a matching opposite phrase)
 
 Current phase: product acceptance, polish, real-world reliability
 ├── Documentation maintenance
