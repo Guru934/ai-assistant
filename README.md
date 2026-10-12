@@ -61,6 +61,29 @@ independently verified results.
   to the Goose child only as `GOOGLE_API_KEY`. Either Goose variant
   can be given an explicit model through `CAT_TALKER_GOOSE_MODEL`.
   Neither backend is sandboxed.
+- **Conservative Python/pytest auto-verification** — after a successful
+  coding task, the worker may run a routine automatic check when the
+  workspace shows credible pytest markers (`pytest.ini`, `conftest.py`,
+  `test_*.py`, `*_test.py` in the root, `tests/`, or `test/`) and a
+  usable interpreter is found (`.venv/bin/python` preferred, otherwise
+  `python3`). A fixed argv (`python -m pytest -q`) is passed to the
+  existing verification engine inside the same Bubblewrap sandbox.
+  Interpreter probes use isolated Python (`-I` +
+  `importlib.util.find_spec('pytest')`) with distinctive exit codes
+  (10 = pytest found, 11 = missing); Bubblewrap setup/launch/timeout
+  failures never silently collapse into a false verdict — they yield
+  `verification_unavailable` with an honest reason. An explicit
+  user-supplied `verify_command` bypasses detection entirely and
+  preserves exact argv order. An explicit request for independent
+  verification without a command stops before the worker and asks which
+  exact command to run; routine auto-checks never satisfy that
+  requirement. Opt-out phrases ("do not run tests", "don't run pytest",
+  "avoid running tests", "skip all checks", "do not run any checks",
+  "don't execute any checks", etc.) suppress automatic execution. The
+  precedence rule is conservative: a genuine opt-out blocks unless a
+  matching opposite phrase ("do not skip tests") specifically negates
+  it; contradictory instructions in any order disable automatic
+  execution rather than enabling it.
 - **Sleep/wake with 60 s meaningful-idle timeout** — starts SLEEPING (no
   Live session, no mic forwarding). Waking opens one fresh session;
   sleeping closes it cleanly with no reconnect loop. Only accepted
@@ -278,9 +301,15 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
   `wake_word_enabled: true`; otherwise F2 wakes. Hyprland needed for
   global keys; needs network + a valid Gemini key.
 - Coding worker runs sandboxed by default under bubblewrap
-  (`CAT_TALKER_CODER_SANDBOX=bwrap` default; `none` is an explicit compatibility escape hatch); unsandboxed runs
-  have no OS sandbox (see above); worker-reported tests
-  are claims until independently verified.
+  (`CAT_TALKER_CODER_SANDBOX=bwrap` default; `none` is an explicit
+  compatibility escape hatch). The sandbox confines the worker to the
+  workspace (writable), a throwaway HOME/XDG area, and a private /tmp —
+  never the real home, host /tmp, SSH keys, browser profiles, or
+  desktop IPC. Network stays shared (cloud CLIs need it); missing bwrap
+  fails closed, never unsandboxed. This is filesystem/process
+  confinement, not a kernel security boundary. Verification runs inside
+  the same boundary. Unsandboxed runs have no OS sandbox; worker-reported
+  tests are claims until independently verified.
 - `read_aloud` needs `espeak-ng`, else honest failure.
 - Reminders fire only while the Chibi process runs (no daemon
   persistence beyond the session); once/daily only, no snooze/edit,
@@ -298,7 +327,7 @@ create_bind("F3", hl.dsp.exec_cmd("/home/guru/ai-assistant/bin/assistant-control
 ./.venv/bin/python -m pytest -q
 ```
 
-623 passed, no hardware or network needed (fakes for Live sessions,
+720 passed, no hardware or network needed (fakes for Live sessions,
 audio, vision, Qt offscreen, playerctl, subprocess, network). Covers
 session lifecycle, single mic-worker ownership, stream recreation,
 computer-use grounding + stale-frame protection + multi-step context,
@@ -307,11 +336,11 @@ window lifecycle, shutdown, voice config (VAD/hints/guard), wake
 word, tray + bubble UI, settings, secure credentials + migration,
 reminders (store, scheduler, contract), Goose opt-in backend +
 credential handoff, media watcher, web info, Weather, Memory, TTS, assistant text
-stream, coding worker + verification + sandbox, workspace switching
-(user-facing 1–6), auto-hide visibility behavior, diagnostics, and
-packaging.
+stream, coding worker + verification + sandbox + auto-verification,
+workspace switching (user-facing 1–6), auto-hide visibility behavior,
+diagnostics, and packaging.
 
-Current state: automated suite 623 passed at the `9b2928d` code
+Current state: automated suite 720 passed at the `af88a6b` code
 checkpoint (current GitHub main); live desktop acceptance
 human-verified PASS (workspace 5/6, app-open auto-hide, F1 restore,
 F2 wake/listen, F3 quit; no defects) — recorded separately from the
